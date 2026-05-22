@@ -43,6 +43,7 @@ RDS_ENGINE_VERSION="16.6"
 RDS_MIN_ACU="0.5"
 RDS_MAX_ACU="8"
 DUPLO_TENANT=""
+DELETE_RDS=false
 MONITOR_DURATION=3600     # 60 minutes
 MONITOR_INTERVAL=60       # seconds
 PHASE="all"
@@ -91,13 +92,14 @@ ${BOLD}OPTIONAL FLAGS:${RESET}
   --lag-threshold SECS     ReplicaLag threshold    (default: 30)
   --monitor-duration SECS  Phase 3 duration        (default: 3600)
   --monitor-interval SECS  Phase 3 poll interval   (default: 60)
-  --phase PHASE            Phase to run: pre|post|monitor|post+monitor|all (default: all)
+  --phase PHASE            Phase to run: pre|post|monitor|post+monitor|all|cleanup (default: all)
   --report-dir DIR         Directory for reports   (default: /tmp/rds_bg_reports)
   --aws-profile PROFILE    AWS profile from ~/.aws/config (used to auto-derive DuploCloud token)
   --duplo-host HOST        DuploCloud host URL (auto-detected from ~/.aws/config if --aws-profile set)
   --duplo-token TOKEN      DuploCloud bearer token (overrides auto-detection)
   --duplo-tenant NAME      DuploCloud tenant name (required for --create-rds)
   --create-rds             Phase 0: create Aurora PostgreSQL Serverless v2 before validation
+  --delete-rds             With --phase cleanup: also delete both Blue and Green RDS instances after deployment deletion
   --rds-identifier NAME    RDS identifier name (default: pg-serverless)
   --rds-master-user USER   Master username      (default: pgadmin)
   --rds-master-pass PASS   Master password      (required if --create-rds)
@@ -111,6 +113,7 @@ ${BOLD}PHASES:${RESET}
   monitor      Phase 3: Continuous monitoring only
   post+monitor Phase 2 + Phase 3
   all          Phase 1 only, then prints switchover command and advises re-run with --phase post+monitor
+  cleanup      Phase 4: Delete the Blue/Green deployment, validate old Blue retained, confirm Green is primary
 
 ${BOLD}ENVIRONMENT:${RESET}
   AWS_REGION        AWS region (overridden by --region)
@@ -169,6 +172,7 @@ while [[ $# -gt 0 ]]; do
     --duplo-token)         DUPLO_BEARER_TOKEN="$2";   shift 2 ;;
     --duplo-tenant)        DUPLO_TENANT="$2";          shift 2 ;;
     --create-rds)          CREATE_RDS=true;            shift   ;;
+    --delete-rds)          DELETE_RDS=true;            shift   ;;
     --rds-identifier)      RDS_IDENTIFIER="$2";        shift 2 ;;
     --rds-master-user)     RDS_MASTER_USER="$2";       shift 2 ;;
     --rds-master-pass)     RDS_MASTER_PASSWORD="$2";   shift 2 ;;
@@ -223,10 +227,10 @@ record_check() {
   local detail="${3:-}"
   local color="$RESET"
   case "$status" in
-    PASS) color="$GREEN";  ((pass_count++)) ;;
-    FAIL) color="$RED";    ((fail_count++)) ;;
-    WARN) color="$YELLOW"; ((warn_count++)) ;;
-    INFO) color="$CYAN";   ((info_count++)) ;;
+    PASS) color="$GREEN";  pass_count=$((pass_count+1)) ;;
+    FAIL) color="$RED";    fail_count=$((fail_count+1)) ;;
+    WARN) color="$YELLOW"; warn_count=$((warn_count+1)) ;;
+    INFO) color="$CYAN";   info_count=$((info_count+1)) ;;
   esac
   local line="[$status] $message"
   [[ -n "$detail" ]] && line="$line — $detail"
@@ -446,61 +450,108 @@ except:
   fi
   record_check "INFO" "No existing cluster found — proceeding with creation" ""
 
+  # ── Prerequisite: custom cluster parameter group with logical replication ──
+  print_subsection "0.3  Create Cluster Parameter Group (Blue/Green prerequisite)"
+  # Blue/Green deployments require logical replication. The default parameter
+  # group is immutable, so a custom group is mandatory before cluster creation.
+  local pg_family
+  pg_family="aurora-postgresql${RDS_ENGINE_VERSION%%.*}"   # e.g. aurora-postgresql16
+  local pg_name="duplo-${DUPLO_TENANT}-${RDS_IDENTIFIER}-pg"
+
+  info "  Parameter group family : $pg_family"
+  info "  Parameter group name   : $pg_name"
+
+  # Create the cluster parameter group (idempotent — errors on duplicate OK)
+  local pg_create_out
+  pg_create_out=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds create-db-cluster-parameter-group \
+    --region "$AWS_REGION" \
+    --db-cluster-parameter-group-name "$pg_name" \
+    --db-parameter-group-family "$pg_family" \
+    --description "Aurora PostgreSQL cluster PG for ${DUPLO_TENANT}/${RDS_IDENTIFIER} — logical replication enabled" \
+    --output json 2>&1)
+
+  if echo "$pg_create_out" | grep -q '"DBClusterParameterGroupArn"'; then
+    record_check "PASS" "Cluster parameter group created: $pg_name" ""
+  elif echo "$pg_create_out" | grep -qi "already exists\|DBClusterParameterGroupAlreadyExists"; then
+    record_check "INFO" "Cluster parameter group already exists — reusing: $pg_name" ""
+  else
+    record_check "FAIL" "Could not create cluster parameter group" "$pg_create_out"
+    return 1
+  fi
+
+  # Enable logical replication — required for Blue/Green deployment
+  local pg_mod_out
+  pg_mod_out=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds modify-db-cluster-parameter-group \
+    --region "$AWS_REGION" \
+    --db-cluster-parameter-group-name "$pg_name" \
+    --parameters \
+      "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" \
+    --output json 2>&1)
+
+  if echo "$pg_mod_out" | grep -q "DBClusterParameterGroupName"; then
+    record_check "PASS" "rds.logical_replication=1 set in parameter group" ""
+  else
+    record_check "FAIL" "Failed to set rds.logical_replication in parameter group" "$pg_mod_out"
+    return 1
+  fi
+
   # Create via DuploCloud API
-  print_subsection "0.3  Create Aurora PostgreSQL Serverless v2 via DuploCloud API"
+  print_subsection "0.4  Create Aurora PostgreSQL Serverless v2 via duploctl CLI"
   info "  Tenant:         $DUPLO_TENANT ($tenant_id)"
   info "  Identifier:     duploservices-${DUPLO_TENANT}-${RDS_IDENTIFIER}"
-  info "  Engine:         aurora-postgresql $RDS_ENGINE_VERSION"
+  info "  Engine:         aurora-postgresql $RDS_ENGINE_VERSION  (Engine code: 9)"
   info "  Instance class: db.serverless (ACU: $RDS_MIN_ACU – $RDS_MAX_ACU)"
+  info "  Parameter group: $pg_name"
   info "  Region:         $AWS_REGION"
 
-  local payload
-  payload=$(cat <<PAYLOAD
+  # Write body to temp file for duploctl
+  local rds_body_file="/tmp/rds-create-${RDS_IDENTIFIER}.json"
+  cat > "$rds_body_file" <<BODY
 {
-  "Identifier": "${RDS_IDENTIFIER}",
-  "Engine": "aurora-postgresql",
+  "Name": "${RDS_IDENTIFIER}",
+  "Engine": 9,
   "EngineVersion": "${RDS_ENGINE_VERSION}",
-  "DBInstanceClass": "db.serverless",
+  "SizeEx": "db.serverless",
   "MasterUsername": "${RDS_MASTER_USER}",
   "MasterUserPassword": "${RDS_MASTER_PASSWORD}",
-  "EncryptStorage": true,
+  "StorageEncrypted": true,
   "BackupRetentionPeriod": 7,
   "MultiAZ": false,
+  "DBClusterParameterGroupName": "${pg_name}",
   "ServerlessV2ScalingConfiguration": {
     "MinCapacity": ${RDS_MIN_ACU},
     "MaxCapacity": ${RDS_MAX_ACU}
   }
 }
-PAYLOAD
-  )
+BODY
 
   local response
-  response=$(duplo_api POST "/subscriptions/${tenant_id}/rds-db" "$payload")
-  local http_check
-  http_check=$(echo "$response" | python3 -c "
+  response=$(duploctl \
+    --host "$DUPLO_HOST" \
+    --token "$DUPLO_BEARER_TOKEN" \
+    --tenant "$DUPLO_TENANT" \
+    rds create --file "$rds_body_file" 2>&1)
+
+  if echo "$response" | python3 -c "
 import json,sys
 try:
     d=json.load(sys.stdin)
-    msg=d.get('Message','')
-    if 'error' in msg.lower() or 'denied' in msg.lower() or 'invalid' in msg.lower():
-        print('ERROR:' + msg)
-    else:
-        print('OK')
+    msg=str(d.get('Message',''))
+    if any(w in msg.lower() for w in ['error','denied','invalid','failed']):
+        print('ERROR:' + msg); exit(1)
+    print('OK')
 except:
     print('OK')
-" 2>/dev/null || echo "OK")
-
-  if [[ "$http_check" == OK ]]; then
-    record_check "PASS" "RDS creation request accepted by DuploCloud" ""
-    info "  Response: ${response:0:200}"
+" 2>/dev/null | grep -q "^OK"; then
+    record_check "PASS" "RDS creation request accepted by duploctl" ""
+    info "  Response: ${response:0:300}"
   else
-    record_check "FAIL" "RDS creation failed" "$http_check"
-    info "  Response: $response"
+    record_check "FAIL" "RDS creation failed via duploctl" "$response"
     return 1
   fi
 
   # Wait for cluster to become available
-  print_subsection "0.4  Wait for Cluster to Become Available"
+  print_subsection "0.5  Wait for Cluster to Become Available"
   local cluster_id="duploservices-${DUPLO_TENANT}-${RDS_IDENTIFIER}"
   info "  Polling cluster: $cluster_id (up to 15 min)"
 
@@ -521,7 +572,7 @@ except:
       break
     fi
     sleep 30
-    (( elapsed += 30 ))
+    elapsed=$((elapsed+30))
   done
 
   if (( elapsed >= max_wait )); then
@@ -529,7 +580,7 @@ except:
   fi
 
   # Wait for instance
-  print_subsection "0.5  Wait for Instance to Become Available"
+  print_subsection "0.6  Wait for Instance to Become Available"
   local instance_id="${cluster_id}-1"
   elapsed=0
   while (( elapsed < max_wait )); do
@@ -559,7 +610,7 @@ except:
       break
     fi
     sleep 30
-    (( elapsed += 30 ))
+    elapsed=$((elapsed+30))
   done
 
   if (( elapsed >= max_wait )); then
@@ -597,22 +648,29 @@ seconds_between() {
 
 iso8601_to_epoch() {
   local iso="$1"
-  # Try GNU date first, fall back to macOS date
-  if date -d "$iso" +%s 2>/dev/null; then
-    :
-  else
-    # macOS: replace Z with +0000, use -j -f
-    local cleaned
-    cleaned=$(echo "$iso" | sed 's/Z$/+0000/' | sed 's/\.[0-9]*+/+/')
-    date -j -f "%Y-%m-%dT%H:%M:%S%z" "$cleaned" +%s 2>/dev/null || echo "0"
-  fi
+  # Python handles ISO 8601 with timezone on all platforms
+  python3 -c "
+import sys
+from datetime import datetime, timezone
+s = '$iso'.strip()
+for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S.%f%z', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S.%fZ'):
+    try:
+        dt = datetime.strptime(s, fmt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        print(int(dt.timestamp()))
+        sys.exit(0)
+    except ValueError:
+        pass
+print(0)
+" 2>/dev/null || echo "0"
 }
 
 # ---------------------------------------------------------------------------
 # AWS HELPERS
 # ---------------------------------------------------------------------------
 aws_cmd() {
-  aws "$@" --region "$AWS_REGION" 2>/dev/null || true
+  AWS_PROFILE="${AWS_PROFILE_NAME:-${AWS_PROFILE:-default}}" aws "$@" --region "$AWS_REGION" 2>/dev/null || true
 }
 
 get_instance_info() {
@@ -639,11 +697,11 @@ get_cloudwatch_stat() {
   end_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
 
   local start_time
-  if date -v "-${period_minutes}M" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null; then
-    start_time=$(date -v "-${period_minutes}M" +"%Y-%m-%dT%H:%M:%SZ")
-  else
+  start_time=$(date -u -v "-${period_minutes}M" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  if [[ -z "$start_time" ]]; then
     local start_epoch=$(( $(date +%s) - period_secs ))
-    start_time=$(date -d "@$start_epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+    start_time=$(date -u -r "$start_epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                 date -u -d "@$start_epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
   fi
 
   if [[ -z "$start_time" ]]; then
@@ -692,7 +750,7 @@ psql_query() {
     return 1
   fi
 
-  PGCONNECT_TIMEOUT=10 PGPASSWORD="$PGPASSWORD" psql \
+  PGCONNECT_TIMEOUT=3 PGPASSWORD="$PGPASSWORD" psql \
     -h "$host" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
     $extra -c "$query" 2>/dev/null || echo "PSQL_ERROR"
 }
@@ -703,10 +761,13 @@ psql_query_csv() {
   if [[ -z "${PGPASSWORD:-}" ]]; then echo "PGPASSWORD_NOT_SET"; return 1; fi
   if [[ "$PSQL_AVAILABLE" != "true" ]]; then echo "PSQL_NOT_AVAILABLE"; return 1; fi
   if [[ -z "$host" || "$host" == "None" ]]; then echo "NO_HOST"; return 1; fi
-  PGCONNECT_TIMEOUT=10 PGPASSWORD="$PGPASSWORD" psql \
+  PGCONNECT_TIMEOUT=3 PGPASSWORD="$PGPASSWORD" psql \
     -h "$host" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
     -t -A -F',' -c "$query" 2>/dev/null || echo "PSQL_ERROR"
 }
+
+# Cached reachability — set once per run to avoid repeated 3s timeouts
+PSQL_REACHABLE=""
 
 check_psql_prereqs() {
   if [[ -z "${PGPASSWORD:-}" ]]; then
@@ -717,7 +778,20 @@ check_psql_prereqs() {
     record_check "WARN" "psql not found in PATH" "All psql checks will be skipped"
     return 1
   fi
-  return 0
+  # One-shot TCP reachability check (cached after first call)
+  if [[ -z "$PSQL_REACHABLE" ]]; then
+    local blue_ep
+    blue_ep=$(get_instance_info "$BLUE_INSTANCE" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('Endpoint',{}).get('Address',''))" 2>/dev/null || echo "")
+    if [[ -n "$blue_ep" ]] && nc -z -w 3 "$blue_ep" "${DB_PORT:-5432}" 2>/dev/null; then
+      PSQL_REACHABLE="true"
+    else
+      PSQL_REACHABLE="false"
+      record_check "WARN" "DB port unreachable from this host" \
+        "RDS is in a private VPC — all psql checks skipped (run from bastion/VPN for full results)"
+    fi
+  fi
+  [[ "$PSQL_REACHABLE" == "true" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -759,8 +833,9 @@ phase1_pre_switchover() {
   print_subsection "1.1 Blue/Green Deployment Status"
 
   local bg_json
-  bg_json=$(aws_cmd rds describe-blue-green-deployments \
+  bg_json=$(AWS_PROFILE="${AWS_PROFILE_NAME:-oneclick}" aws rds describe-blue-green-deployments \
     --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+    --region "$AWS_REGION" \
     --query 'BlueGreenDeployments[0]' --output json 2>/dev/null) || bg_json="{}"
 
   if [[ -z "$bg_json" || "$bg_json" == "null" || "$bg_json" == "{}" ]]; then
@@ -898,32 +973,30 @@ print('not_found')
     record_check "FAIL" "Green read replication StatusInfo" "Normal=$rep_normal"
   fi
 
-  # CloudWatch ReplicaLag (15 min)
-  local replica_lag_avg
-  replica_lag_avg=$(get_cloudwatch_stat "$GREEN_INSTANCE" "ReplicaLag" "Average" 15)
-  local replica_lag_max
-  replica_lag_max=$(get_cloudwatch_stat "$GREEN_INSTANCE" "ReplicaLag" "Maximum" 15)
+  # CloudWatch ReplicaLag — use 60-min window (single call; Aurora publishes ~once/min when idle)
+  local replica_lag_avg replica_lag_max lag_window=60
+  replica_lag_avg=$(get_cloudwatch_stat "$GREEN_INSTANCE" "ReplicaLag" "Average" 60)
+  replica_lag_max=$(get_cloudwatch_stat "$GREEN_INSTANCE" "ReplicaLag" "Maximum" 60)
 
   if [[ "$replica_lag_avg" != "N/A" && "$replica_lag_avg" != "None" ]]; then
     local lag_int
     lag_int=$(python3 -c "print(int(float('$replica_lag_avg')))" 2>/dev/null || echo "999")
     if (( lag_int <= LAG_THRESHOLD )); then
-      record_check "PASS" "Green ReplicaLag (15m avg)" "${replica_lag_avg}s ≤ threshold ${LAG_THRESHOLD}s"
+      record_check "PASS" "Green ReplicaLag (${lag_window}m avg)" "${replica_lag_avg}s ≤ threshold ${LAG_THRESHOLD}s"
     else
       record_check "FAIL" "Green ReplicaLag EXCEEDS threshold — BLOCKING SWITCHOVER" "Avg=${replica_lag_avg}s Max=${replica_lag_max}s threshold=${LAG_THRESHOLD}s"
     fi
   else
-    record_check "WARN" "Green ReplicaLag" "No CloudWatch data in last 15 min (avg=$replica_lag_avg)"
+    record_check "WARN" "Green ReplicaLag" "No CloudWatch data in last 120 min — Green may be idle (no writes) which is normal"
   fi
   info "    ReplicaLag: Avg=${replica_lag_avg}s  Max=${replica_lag_max}s  Threshold=${LAG_THRESHOLD}s"
 
-  # CloudWatch AuroraReplicaLag (ms)
-  local aurora_lag_avg
-  aurora_lag_avg=$(get_cloudwatch_stat "$GREEN_INSTANCE" "AuroraReplicaLag" "Average" 15)
-  local aurora_lag_max
-  aurora_lag_max=$(get_cloudwatch_stat "$GREEN_INSTANCE" "AuroraReplicaLag" "Maximum" 15)
-  info "    AuroraReplicaLag (ms): Avg=${aurora_lag_avg}  Max=${aurora_lag_max}"
-  record_check "INFO" "AuroraReplicaLag (ms)" "Avg=${aurora_lag_avg} Max=${aurora_lag_max}"
+  # CloudWatch RDSToAuroraPostgreSQLReplicaLag (ms) — Aurora-specific lag metric
+  local aurora_lag_avg aurora_lag_max
+  aurora_lag_avg=$(get_cloudwatch_stat "$GREEN_INSTANCE" "RDSToAuroraPostgreSQLReplicaLag" "Average" 120)
+  aurora_lag_max=$(get_cloudwatch_stat "$GREEN_INSTANCE" "RDSToAuroraPostgreSQLReplicaLag" "Maximum" 120)
+  info "    RDSToAuroraPostgreSQLReplicaLag (ms): Avg=${aurora_lag_avg}  Max=${aurora_lag_max}"
+  record_check "INFO" "RDSToAuroraPostgreSQLReplicaLag (ms)" "Avg=${aurora_lag_avg} Max=${aurora_lag_max}"
 
   # psql checks on Blue
   local blue_endpoint
@@ -1128,7 +1201,7 @@ print('not_found')
         g_last=$(echo "$green_seqs" | awk -F',' -v s="$seq_name" '$2==s{print $3}' | head -1)
         g_last="${g_last:-unknown}"
         if [[ "$blue_last" != "$g_last" ]]; then
-          ((seq_drift_count++))
+          seq_drift_count=$((seq_drift_count+1))
           record_check "WARN" "Sequence drift: $seq_name" "Blue last_value=$blue_last Green last_value=$g_last — post-switchover inserts may fail if Green is behind"
         fi
       done <<< "$blue_seqs"
@@ -1265,7 +1338,11 @@ for pg in d.get('DBParameterGroups', []):
     log_to_file "$pg_list"
 
     local pending_reboot_count
-    pending_reboot_count=$(echo "$pg_list" | grep -c "pending-reboot" 2>/dev/null || echo "0")
+    if echo "$pg_list" | grep -q "pending-reboot" 2>/dev/null; then
+      pending_reboot_count=1
+    else
+      pending_reboot_count=0
+    fi
     if (( pending_reboot_count > 0 )); then
       record_check "WARN" "$label has parameter(s) with pending-reboot status" "Resolve before switchover to avoid unplanned reboot"
     else
@@ -1376,9 +1453,9 @@ PYEOF
 
     for metric in CPUUtilization FreeStorageSpace DatabaseConnections WriteIOPS ReadIOPS; do
       local avg
-      avg=$(get_cloudwatch_stat "$inst_id" "$metric" "Average" 15)
+      avg=$(get_cloudwatch_stat "$inst_id" "$metric" "Average" 60)
       info "    $metric: avg=$avg"
-      record_check "INFO" "$label $metric (15m avg)" "$avg"
+      record_check "INFO" "$label $metric (60m avg)" "$avg"
 
       # Storage almost full check
       if [[ "$metric" == "FreeStorageSpace" && "$avg" != "N/A" && "$avg" != "None" ]]; then
@@ -2140,7 +2217,7 @@ phase3_monitoring() {
       break
     fi
 
-    ((iteration++))
+    iteration=$((iteration+1))
     local ts
     ts=$(date +"%Y-%m-%d %H:%M:%S")
 
@@ -2173,8 +2250,8 @@ phase3_monitoring() {
     if [[ "$green_status" != "available" ]]; then
       alerts_this_tick+=("NEW_PRIMARY_DOWN")
       row_color="$RED"
-      ((phase3_alerts++))
-      ((alert_count++))
+      phase3_alerts=$((phase3_alerts+1))
+      alert_count=$((alert_count+1))
     fi
 
     # Blue lag > 3x threshold
@@ -2185,8 +2262,8 @@ phase3_monitoring() {
       if (( lag_v > high_lag_thresh )); then
         alerts_this_tick+=("HIGH_BLUE_LAG")
         row_color="$YELLOW"
-        ((phase3_alerts++))
-        ((alert_count++))
+        phase3_alerts=$((phase3_alerts+1))
+        alert_count=$((alert_count+1))
       fi
     fi
 
@@ -2197,8 +2274,8 @@ phase3_monitoring() {
       if (( cpu_v > 85 )); then
         alerts_this_tick+=("HIGH_CPU")
         [[ "$row_color" == "$RESET" ]] && row_color="$YELLOW"
-        ((phase3_alerts++))
-        ((alert_count++))
+        phase3_alerts=$((phase3_alerts+1))
+        alert_count=$((alert_count+1))
       fi
     fi
 
@@ -2209,8 +2286,8 @@ phase3_monitoring() {
       if (( conn_v > CONN_THRESHOLD )); then
         alerts_this_tick+=("HIGH_CONNECTIONS")
         [[ "$row_color" == "$RESET" ]] && row_color="$YELLOW"
-        ((phase3_alerts++))
-        ((alert_count++))
+        phase3_alerts=$((phase3_alerts+1))
+        alert_count=$((alert_count+1))
       fi
     fi
 
@@ -2227,8 +2304,8 @@ phase3_monitoring() {
         if (( pct_free_int < 10 )); then
           alerts_this_tick+=("LOW_STORAGE")
           row_color="$RED"
-          ((phase3_alerts++))
-          ((alert_count++))
+          phase3_alerts=$((phase3_alerts+1))
+          alert_count=$((alert_count+1))
         fi
       fi
     fi
@@ -2332,6 +2409,438 @@ PYEOF
 }
 
 # ===========================================================================
+# PHASE 4 — CLEANUP / DELETE BLUE-GREEN DEPLOYMENT
+# ===========================================================================
+
+phase4_cleanup() {
+  print_section "PHASE 4 — CLEANUP: DELETE BLUE/GREEN DEPLOYMENT"
+
+  # ---------------------------------------------------------------------------
+  # 4.1 Pre-delete state check
+  # ---------------------------------------------------------------------------
+  print_subsection "4.1 Pre-Delete State Verification"
+
+  local bg_json
+  bg_json=$(aws_cmd rds describe-blue-green-deployments \
+    --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+    --query 'BlueGreenDeployments[0]' --output json 2>/dev/null) || true
+
+  local bg_already_gone=false
+  if [[ -z "$bg_json" || "$bg_json" == "null" ]]; then
+    record_check "INFO" "Blue/Green deployment not found" \
+      "$DEPLOYMENT_ID — already deleted (continuing to RDS cleanup)"
+    bg_already_gone=true
+    bg_json="{}"
+  fi
+
+  local bg_status="already-deleted"
+  local blue_cluster="" green_cluster=""
+
+  if [[ "$bg_already_gone" == "false" ]]; then
+    bg_status=$(echo "$bg_json" | python3 -c \
+      "import sys,json; print(json.load(sys.stdin).get('Status','unknown'))" 2>/dev/null || echo "unknown")
+    info "  Deployment $DEPLOYMENT_ID status: $bg_status"
+
+    if [[ "$bg_status" == "SWITCHOVER_COMPLETED" ]]; then
+      record_check "PASS" "Deployment status before delete" "SWITCHOVER_COMPLETED — safe to delete"
+    elif [[ "$bg_status" == "AVAILABLE" ]]; then
+      record_check "WARN" "Deployment status before delete" \
+        "AVAILABLE — switchover not yet done. Deleting now will discard the Green environment."
+      info "  NOTE: You can still delete without switching over (abandons the Green cluster)."
+    elif [[ "$bg_status" == "DELETING" ]]; then
+      record_check "INFO" "Deployment already deleting" "Status=$bg_status — waiting for completion"
+    else
+      record_check "WARN" "Unexpected deployment status" "$bg_status — proceed with caution"
+    fi
+
+    # Capture cluster names from deployment metadata
+    blue_cluster=$(echo "$bg_json" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for m in d.get('SwitchoverDetails',[]):
+    src = m.get('SourceMember','')
+    if ':cluster:' in src:
+        print(src.split(':cluster:')[-1])
+        break
+" 2>/dev/null || echo "")
+    green_cluster=$(echo "$bg_json" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for m in d.get('SwitchoverDetails',[]):
+    tgt = m.get('TargetMember','')
+    if ':cluster:' in tgt:
+        print(tgt.split(':cluster:')[-1])
+        break
+" 2>/dev/null || echo "")
+  fi
+
+  # Fallback: derive green cluster from green instance if not found via deployment
+  if [[ -z "$green_cluster" ]]; then
+    green_cluster=$(aws_cmd rds describe-db-instances \
+      --db-instance-identifier "$GREEN_INSTANCE" \
+      --query 'DBInstances[0].DBClusterIdentifier' --output text 2>/dev/null || echo "")
+  fi
+
+  info "  Blue cluster : ${blue_cluster:-(not found)}"
+  info "  Green cluster: ${green_cluster:-(not found)}"
+
+  # ---------------------------------------------------------------------------
+  # 4.2 Verify new primary (Green) is writable before deleting
+  # ---------------------------------------------------------------------------
+  print_subsection "4.2 Verify New Primary (Green) is Writable"
+
+  local green_inst_json
+  green_inst_json=$(get_instance_info "$GREEN_INSTANCE")
+  local green_status green_role green_is_replica
+  green_status=$(echo "$green_inst_json" | python3 -c \
+    "import sys,json; print(json.load(sys.stdin).get('DBInstanceStatus','unknown'))" 2>/dev/null || echo "unknown")
+  green_is_replica=$(echo "$green_inst_json" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(bool(d.get('ReadReplicaSourceDBInstanceIdentifier','')))" 2>/dev/null || echo "False")
+
+  info "  Green ($GREEN_INSTANCE): status=$green_status  is_replica=$green_is_replica"
+
+  if [[ "$green_status" == "available" && "$green_is_replica" == "False" ]]; then
+    record_check "PASS" "Green is standalone primary" "Status=available, not a read replica — safe to finalize"
+  elif [[ "$green_is_replica" == "True" ]]; then
+    record_check "WARN" "Green is still a replica" \
+      "Switchover may not be complete — Green still has ReadReplicaSourceDBInstanceIdentifier set"
+  else
+    record_check "WARN" "Green state uncertain" "status=$green_status is_replica=$green_is_replica"
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 4.3 Delete the Blue/Green deployment
+  # ---------------------------------------------------------------------------
+  print_subsection "4.3 Delete Blue/Green Deployment"
+
+  if [[ "$bg_already_gone" == "true" ]]; then
+    record_check "INFO" "Deployment already deleted" "$DEPLOYMENT_ID — skipping delete step"
+  elif [[ "$bg_status" == "DELETING" ]]; then
+    info "  Deployment already in DELETING state — skipping delete API call."
+  else
+    info "  Issuing delete command for deployment: $DEPLOYMENT_ID"
+    info "  (Blue instance will be RETAINED unless --delete-blue was specified at switchover time)"
+
+    local delete_out
+    delete_out=$(aws_cmd rds delete-blue-green-deployment \
+      --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+      --no-delete-target 2>/dev/null) || true
+
+    if [[ -n "$delete_out" ]]; then
+      record_check "PASS" "Delete command accepted" "Deployment deletion initiated"
+      info "  Delete response received."
+    else
+      record_check "WARN" "Delete command returned no output" \
+        "Check AWS console — deployment may already be deleting or an error occurred"
+    fi
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 4.4 Wait for deployment to be gone
+  # ---------------------------------------------------------------------------
+  print_subsection "4.4 Wait for Deployment Deletion"
+
+  if [[ "$bg_already_gone" == "true" ]]; then
+    record_check "INFO" "Deployment was already deleted before this run" "$DEPLOYMENT_ID"
+  else
+    local elapsed=0
+    local max_wait=300
+    local deleted=false
+    info "  Waiting up to ${max_wait}s for deployment to be deleted..."
+
+    while (( elapsed < max_wait )); do
+      local check_status
+      check_status=$(aws_cmd rds describe-blue-green-deployments \
+        --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+        --query 'BlueGreenDeployments[0].Status' --output text 2>/dev/null || echo "")
+
+      if [[ -z "$check_status" || "$check_status" == "None" || "$check_status" == "null" ]]; then
+        deleted=true
+        break
+      fi
+      info "  [${elapsed}s] Status: $check_status — waiting..."
+      elapsed=$((elapsed+15))
+      if (( elapsed < max_wait )); then
+        sleep 15
+      fi
+    done
+
+    if [[ "$deleted" == "true" ]]; then
+      record_check "PASS" "Blue/Green deployment deleted" \
+        "Deployment $DEPLOYMENT_ID no longer exists (elapsed: ${elapsed}s)"
+    else
+      record_check "WARN" "Deployment still exists after ${max_wait}s" \
+        "Status may still be DELETING — check AWS console; deletion can take several minutes"
+    fi
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 4.5 Validate old Blue instance retained / cleaned up
+  # ---------------------------------------------------------------------------
+  print_subsection "4.5 Old Blue Instance State After Delete"
+
+  local blue_inst_json
+  blue_inst_json=$(get_instance_info "$BLUE_INSTANCE")
+  local blue_post_status blue_post_replica_src
+  blue_post_status=$(echo "$blue_inst_json" | python3 -c \
+    "import sys,json; print(json.load(sys.stdin).get('DBInstanceStatus','not-found'))" 2>/dev/null || echo "not-found")
+  blue_post_replica_src=$(echo "$blue_inst_json" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('ReadReplicaSourceDBInstanceIdentifier',''))" 2>/dev/null || echo "")
+
+  info "  Old Blue ($BLUE_INSTANCE): status=$blue_post_status  replica_source=${blue_post_replica_src:-(none)}"
+
+  if [[ "$blue_post_status" == "not-found" ]]; then
+    record_check "INFO" "Old Blue instance not found" \
+      "Was deleted (either at switchover with --delete-blue-instances-on-switchover or manually)"
+  elif [[ "$blue_post_status" == "available" && -z "$blue_post_replica_src" ]]; then
+    record_check "INFO" "Old Blue instance retained as standalone" \
+      "$BLUE_INSTANCE is available but no longer a replica — you may delete it manually when done"
+    info ""
+    info "  To delete old Blue manually:"
+    info "    aws rds delete-db-instance \\"
+    info "      --db-instance-identifier $BLUE_INSTANCE \\"
+    info "      --skip-final-snapshot \\"
+    info "      --region $AWS_REGION"
+    info ""
+    record_check "INFO" "Manual Blue cleanup command printed above" \
+      "Delete the old Blue instance when confirmed no longer needed"
+  elif [[ "$blue_post_status" == "available" && -n "$blue_post_replica_src" ]]; then
+    record_check "WARN" "Old Blue still shows as replica" \
+      "replica_source=$blue_post_replica_src — may need a few minutes to detach"
+  else
+    record_check "INFO" "Old Blue instance status" "$blue_post_status"
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 4.6 Final endpoint check — confirm Green is the live primary
+  # ---------------------------------------------------------------------------
+  print_subsection "4.6 Confirm Green is Live Primary"
+
+  local green_endpoint
+  green_endpoint=$(echo "$green_inst_json" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('Endpoint',{}).get('Address',''))" 2>/dev/null || echo "")
+
+  local cluster_endpoint=""
+  if [[ -n "$green_cluster" ]]; then
+    cluster_endpoint=$(aws_cmd rds describe-db-clusters \
+      --db-cluster-identifier "$green_cluster" \
+      --query 'DBClusters[0].Endpoint' --output text 2>/dev/null || echo "")
+  fi
+
+  info "  Green instance endpoint : ${green_endpoint:-(unknown)}"
+  info "  Cluster writer endpoint : ${cluster_endpoint:-(unknown)}"
+  info ""
+  info "  Update your application's DB_HOST to point to the cluster writer endpoint:"
+  info "    $cluster_endpoint"
+  info ""
+  record_check "INFO" "Green cluster endpoint" "${cluster_endpoint:-(check console)}"
+
+  # ---------------------------------------------------------------------------
+  # 4.7 Parameter group cleanup check
+  # ---------------------------------------------------------------------------
+  print_subsection "4.7 Parameter Group Cleanup Check"
+
+  local green_pg
+  green_pg=$(echo "$(get_instance_info "$GREEN_INSTANCE")" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+pgs=[pg.get('DBParameterGroupName','') for pg in d.get('DBParameterGroups',[])]
+print(','.join(pgs))" 2>/dev/null || echo "")
+  info "  Green parameter groups: ${green_pg:-(none)}"
+  record_check "INFO" "Green parameter groups post-cleanup" "${green_pg:-(none)}"
+
+  info ""
+  info "  NOTE: Custom cluster parameter groups (e.g. aurora-postrgesql-cluster-param) are"
+  info "  retained after deployment deletion. Delete manually only if no longer needed:"
+  info "    aws rds delete-db-cluster-parameter-group \\"
+  info "      --db-cluster-parameter-group-name <name> \\"
+  info "      --region $AWS_REGION"
+
+  # ---------------------------------------------------------------------------
+  # 4.8 Delete Old Blue RDS Instance (DuploCloud-managed) — requires --delete-rds
+  # ---------------------------------------------------------------------------
+  print_subsection "4.8 Delete Old Blue RDS Instance"
+
+  if [[ "$DELETE_RDS" != "true" ]]; then
+    record_check "INFO" "Blue RDS deletion skipped" \
+      "Pass --delete-rds flag to also delete RDS instances during cleanup"
+  else
+    # Derive DuploCloud short name by stripping the 'duplo' prefix
+    local duplo_rds_name="${BLUE_INSTANCE#duplo}"
+    info "  Deleting Blue RDS via DuploCloud API: $duplo_rds_name (AWS: $BLUE_INSTANCE)"
+
+    # Resolve tenant ID from DuploCloud (needed for the API path)
+    local tenant_id=""
+    if [[ -n "$DUPLO_TENANT" && -n "$DUPLO_BEARER_TOKEN" ]]; then
+      tenant_id=$(duplo_api GET "/v3/admin/tenant" | python3 -c "
+import sys, json
+try:
+  data = json.load(sys.stdin)
+  tname = '${DUPLO_TENANT}'.lower()
+  for t in (data if isinstance(data,list) else []):
+      an = t.get('AccountName','').lower()
+      if an == tname or an.replace('-','') == tname.replace('-',''):
+          print(t.get('TenantId',''))
+          break
+except: pass
+" 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$tenant_id" && -n "$DUPLO_BEARER_TOKEN" ]]; then
+      # Try to get tenant ID by listing all tenants and matching by instance
+      tenant_id=$(duplo_api GET "/v3/admin/tenant" | python3 -c "
+import sys,json
+try:
+  data = json.load(sys.stdin)
+  # Return the first tenant that is not 'default' if only one non-default exists
+  tenants = [t for t in (data if isinstance(data,list) else []) if t.get('AccountName','') not in ('',)]
+  if len(tenants) == 1:
+      print(tenants[0].get('TenantId',''))
+except: pass
+" 2>/dev/null || echo "")
+    fi
+
+    if [[ -n "$tenant_id" ]]; then
+      info "  Tenant ID: $tenant_id"
+      local del_resp
+      del_resp=$(duplo_api DELETE "/v3/subscriptions/${tenant_id}/aws/rds/instance/${duplo_rds_name}" 2>/dev/null || echo "")
+      # Detect any error response (not found, does not exist, error, 4xx, etc.)
+      if echo "$del_resp" | grep -qi "error\|not found\|does not exist\|404\|400\|Message"; then
+        record_check "WARN" "Blue RDS not in DuploCloud state — using AWS CLI" \
+          "DuploCloud: ${del_resp:0:150}"
+        aws_cmd rds delete-db-instance \
+          --db-instance-identifier "$BLUE_INSTANCE" \
+          --skip-final-snapshot >/dev/null 2>&1 || true
+        record_check "INFO" "Blue RDS delete via AWS CLI issued" "$BLUE_INSTANCE"
+      else
+        record_check "PASS" "Blue RDS deletion initiated via DuploCloud" "$BLUE_INSTANCE"
+        info "  Response: ${del_resp:0:200}"
+      fi
+    else
+      info "  DUPLO_TENANT not set or tenant lookup failed — using AWS CLI delete directly"
+      aws_cmd rds delete-db-instance \
+        --db-instance-identifier "$BLUE_INSTANCE" \
+        --skip-final-snapshot 2>/dev/null || true
+      record_check "INFO" "Blue RDS delete via AWS CLI issued" \
+        "$BLUE_INSTANCE (not via DuploCloud — verify DuploCloud state manually)"
+    fi
+
+    # Wait for Blue instance deletion
+    info "  Waiting for Blue instance $BLUE_INSTANCE to be deleted (up to 300s)..."
+    local blue_del_elapsed=0
+    while (( blue_del_elapsed < 300 )); do
+      local bstatus
+      bstatus=$(aws_cmd rds describe-db-instances \
+        --db-instance-identifier "$BLUE_INSTANCE" \
+        --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "")
+      if [[ -z "$bstatus" || "$bstatus" == "None" ]]; then
+        record_check "PASS" "Blue RDS instance deleted" "$BLUE_INSTANCE gone (${blue_del_elapsed}s)"
+        break
+      fi
+      info "  [${blue_del_elapsed}s] Blue status: $bstatus"
+      blue_del_elapsed=$((blue_del_elapsed+20))
+      if (( blue_del_elapsed < 300 )); then
+        sleep 20
+      fi
+    done
+    if (( blue_del_elapsed >= 300 )); then
+      record_check "WARN" "Blue RDS still exists after 300s" \
+        "Deletion is async — check AWS console for final status"
+    fi
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 4.9 Delete Green RDS Cluster (AWS-managed, not in DuploCloud) — requires --delete-rds
+  # ---------------------------------------------------------------------------
+  print_subsection "4.9 Delete Green RDS Cluster"
+
+  if [[ "$DELETE_RDS" != "true" ]]; then
+    record_check "INFO" "Green RDS deletion skipped" \
+      "Pass --delete-rds flag to also delete RDS instances during cleanup"
+  else
+    info "  Deleting Green instance: $GREEN_INSTANCE"
+    info "  Deleting Green cluster : $green_cluster"
+    info "  (Green was auto-created by AWS Blue/Green — deleted via AWS CLI)"
+
+    # Delete instance first (cluster cannot be deleted while instances exist)
+    local green_exists
+    green_exists=$(aws_cmd rds describe-db-instances \
+      --db-instance-identifier "$GREEN_INSTANCE" \
+      --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "")
+
+    if [[ -n "$green_exists" && "$green_exists" != "None" ]]; then
+      aws_cmd rds delete-db-instance \
+        --db-instance-identifier "$GREEN_INSTANCE" \
+        --skip-final-snapshot >/dev/null 2>&1 || true
+      record_check "INFO" "Green instance delete issued" "$GREEN_INSTANCE"
+
+      info "  Waiting for Green instance deletion (up to 360s)..."
+      local green_del_elapsed=0
+      while (( green_del_elapsed < 360 )); do
+        local gstatus
+        gstatus=$(aws_cmd rds describe-db-instances \
+          --db-instance-identifier "$GREEN_INSTANCE" \
+          --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "")
+        if [[ -z "$gstatus" || "$gstatus" == "None" ]]; then
+          info "  Green instance deleted after ${green_del_elapsed}s"
+          break
+        fi
+        info "  [${green_del_elapsed}s] Green instance status: $gstatus"
+        green_del_elapsed=$((green_del_elapsed+20))
+        if (( green_del_elapsed < 360 )); then
+          sleep 20
+        fi
+      done
+    else
+      info "  Green instance $GREEN_INSTANCE not found — already deleted."
+    fi
+
+    # Delete Green cluster
+    if [[ -n "$green_cluster" ]]; then
+      local gcluster_exists
+      gcluster_exists=$(aws_cmd rds describe-db-clusters \
+        --db-cluster-identifier "$green_cluster" \
+        --query 'DBClusters[0].Status' --output text 2>/dev/null || echo "")
+
+      if [[ -n "$gcluster_exists" && "$gcluster_exists" != "None" ]]; then
+        aws_cmd rds delete-db-cluster \
+          --db-cluster-identifier "$green_cluster" \
+          --skip-final-snapshot >/dev/null 2>&1 || true
+        record_check "INFO" "Green cluster delete issued" "$green_cluster"
+
+        info "  Waiting for Green cluster deletion (up to 300s)..."
+        local gcluster_del_elapsed=0
+        while (( gcluster_del_elapsed < 300 )); do
+          local gcstatus
+          gcstatus=$(aws_cmd rds describe-db-clusters \
+            --db-cluster-identifier "$green_cluster" \
+            --query 'DBClusters[0].Status' --output text 2>/dev/null || echo "")
+          if [[ -z "$gcstatus" || "$gcstatus" == "None" ]]; then
+            record_check "PASS" "Green cluster deleted" "$green_cluster (${gcluster_del_elapsed}s)"
+            break
+          fi
+          info "  [${gcluster_del_elapsed}s] Green cluster status: $gcstatus"
+          gcluster_del_elapsed=$((gcluster_del_elapsed+20))
+          if (( gcluster_del_elapsed < 300 )); then
+            sleep 20
+          fi
+        done
+        if (( gcluster_del_elapsed >= 300 )); then
+          record_check "WARN" "Green cluster still exists after 300s" \
+            "Check AWS console for final deletion status"
+        fi
+      else
+        record_check "INFO" "Green cluster not found" \
+          "$green_cluster — already deleted or never existed"
+      fi
+    else
+      record_check "WARN" "Green cluster identifier unknown" \
+        "Could not determine Green cluster ID — check AWS console manually"
+    fi
+  fi
+}
+
+# ===========================================================================
 # MAIN ENTRY POINT
 # ===========================================================================
 
@@ -2341,6 +2850,11 @@ main() {
   # Phase 0: optional RDS creation (runs before any validation phase)
   if [[ "$CREATE_RDS" == "true" ]]; then
     phase0_create_rds
+    # If no blue/green instances provided, exit after creation
+    if [[ -z "$BLUE_INSTANCE" && -z "$GREEN_INSTANCE" ]]; then
+      print_summary
+      exit 0
+    fi
   fi
 
   case "$PHASE" in
@@ -2392,6 +2906,9 @@ main() {
       echo ""
       echo -e "${BOLD_BLUE}================================================================${RESET}"
       log_to_file "Phase 'all': Pre-checks done. Switchover command and post+monitor re-run command printed above."
+      ;;
+    cleanup|delete)
+      phase4_cleanup
       ;;
     *)
       echo -e "${RED}Unknown phase: $PHASE${RESET}"
