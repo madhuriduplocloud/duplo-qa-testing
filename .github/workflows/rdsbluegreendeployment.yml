@@ -60,28 +60,13 @@ jobs:
           chmod +x validate_rds_blue_green.sh
 
       # -----------------------------------------------------------------------
-      - name: Setup AWS via DuploCloud JIT
-        run: |
-          python3 - <<'PY'
-          import os, sys, json, urllib.request
-          host  = os.environ["DUPLO_HOST"].rstrip("/")
-          token = os.environ["DUPLO_TOKEN"]
-          region = os.environ.get("AWS_REGION", "us-east-2")
-          url = f"{host}/adminproxy/GetJITAwsConsoleAccessUrl"
-          req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-          with urllib.request.urlopen(req, timeout=30) as r:
-              creds = json.loads(r.read())
-          env_file = os.environ["GITHUB_ENV"]
-          with open(env_file, "a") as f:
-              f.write(f"AWS_ACCESS_KEY_ID={creds['AccessKeyId']}\n")
-              f.write(f"AWS_SECRET_ACCESS_KEY={creds['SecretAccessKey']}\n")
-              f.write(f"AWS_SESSION_TOKEN={creds['SessionToken']}\n")
-              f.write(f"AWS_DEFAULT_REGION={region}\n")
-          print(f"AWS creds obtained — KeyId={creds['AccessKeyId'][:12]}... expires={creds.get('Expiration','?')}")
-          PY
-        env:
-          DUPLO_HOST:  ${{ vars.DUPLO_HOST }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+      - name: Setup AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ inputs.region }}
 
       # -----------------------------------------------------------------------
       - name: Phase 0 — Create RDS Instance
