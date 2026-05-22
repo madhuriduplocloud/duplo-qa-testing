@@ -434,7 +434,7 @@ except:
   # Check if RDS already exists
   print_subsection "0.2  Check for Existing RDS"
   local existing
-  existing=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-clusters \
+  existing=$(aws_rds_direct describe-db-clusters \
     --region "$AWS_REGION" \
     --query "DBClusters[?contains(DBClusterIdentifier,\`${RDS_IDENTIFIER}\`)].{ID:DBClusterIdentifier,Status:Status}" \
     --output json 2>/dev/null || echo "[]")
@@ -463,7 +463,7 @@ except:
 
   # Create the cluster parameter group (idempotent — errors on duplicate OK)
   local pg_create_out
-  pg_create_out=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds create-db-cluster-parameter-group \
+  pg_create_out=$(aws_rds_direct create-db-cluster-parameter-group \
     --region "$AWS_REGION" \
     --db-cluster-parameter-group-name "$pg_name" \
     --db-parameter-group-family "$pg_family" \
@@ -481,7 +481,7 @@ except:
 
   # Enable logical replication — required for Blue/Green deployment
   local pg_mod_out
-  pg_mod_out=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds modify-db-cluster-parameter-group \
+  pg_mod_out=$(aws_rds_direct modify-db-cluster-parameter-group \
     --region "$AWS_REGION" \
     --db-cluster-parameter-group-name "$pg_name" \
     --parameters \
@@ -559,7 +559,7 @@ except:
   local max_wait=900
   while (( elapsed < max_wait )); do
     local status
-    status=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-clusters \
+    status=$(aws_rds_direct describe-db-clusters \
       --region "$AWS_REGION" \
       --db-cluster-identifier "$cluster_id" \
       --query 'DBClusters[0].Status' \
@@ -585,7 +585,7 @@ except:
   elapsed=0
   while (( elapsed < max_wait )); do
     local inst_status
-    inst_status=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-instances \
+    inst_status=$(aws_rds_direct describe-db-instances \
       --region "$AWS_REGION" \
       --db-instance-identifier "$instance_id" \
       --query 'DBInstances[0].DBInstanceStatus' \
@@ -595,7 +595,7 @@ except:
 
     if [[ "$inst_status" == "available" ]]; then
       local ep
-      ep=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-clusters \
+      ep=$(aws_rds_direct describe-db-clusters \
         --region "$AWS_REGION" \
         --db-cluster-identifier "$cluster_id" \
         --query 'DBClusters[0].Endpoint' \
@@ -670,7 +670,21 @@ print(0)
 # AWS HELPERS
 # ---------------------------------------------------------------------------
 aws_cmd() {
-  AWS_PROFILE="${AWS_PROFILE_NAME:-${AWS_PROFILE:-default}}" aws "$@" --region "$AWS_REGION" 2>/dev/null || true
+  if [[ -n "${AWS_PROFILE_NAME:-}" ]]; then
+    AWS_PROFILE="$AWS_PROFILE_NAME" aws "$@" --region "$AWS_REGION" 2>/dev/null || true
+  else
+    aws "$@" --region "$AWS_REGION" 2>/dev/null || true
+  fi
+}
+
+# aws_rds_direct: like aws_cmd but passes args literally (no --region appended, no error suppression)
+# Used in Phase 0 where we need full output and explicit region in args
+aws_rds_direct() {
+  if [[ -n "${AWS_PROFILE_NAME:-}" ]]; then
+    AWS_PROFILE="$AWS_PROFILE_NAME" aws rds "$@"
+  else
+    aws rds "$@"
+  fi
 }
 
 get_instance_info() {
@@ -833,10 +847,9 @@ phase1_pre_switchover() {
   print_subsection "1.1 Blue/Green Deployment Status"
 
   local bg_json
-  bg_json=$(AWS_PROFILE="${AWS_PROFILE_NAME:-oneclick}" aws rds describe-blue-green-deployments \
+  bg_json=$(aws_cmd rds describe-blue-green-deployments \
     --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
-    --region "$AWS_REGION" \
-    --query 'BlueGreenDeployments[0]' --output json 2>/dev/null) || bg_json="{}"
+    --query 'BlueGreenDeployments[0]' --output json) || bg_json="{}"
 
   if [[ -z "$bg_json" || "$bg_json" == "null" || "$bg_json" == "{}" ]]; then
     record_check "FAIL" "Blue/Green deployment not found" "$DEPLOYMENT_ID"
