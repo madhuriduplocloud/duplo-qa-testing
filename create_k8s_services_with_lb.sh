@@ -151,21 +151,21 @@ for i in $(seq 1 "$SERVICE_COUNT"); do
 
   if [[ "$DELETE_MODE" == "true" ]]; then
     if delete_service "$name" &>/dev/null; then
-      ok "Deleted $name"; ((success++))
+      ok "Deleted $name"; success=$((success + 1))
     else
-      err "Failed to delete $name"; ((failed++))
+      err "Failed to delete $name"; failed=$((failed + 1))
     fi
   else
     if create_service "$name" &>/dev/null; then
       ok "Created $name"
-      ((success++))
+      success=$((success + 1))
       if attach_lb "$name" &>/dev/null; then
         ok "  └─ ALB attached  [${PROTOCOL}:${EXTERNAL_PORT}]"
       else
         warn "  └─ $name created but LB attachment failed"
       fi
     else
-      err "Failed to create $name"; ((failed++))
+      err "Failed to create $name"; failed=$((failed + 1))
     fi
   fi
 done
