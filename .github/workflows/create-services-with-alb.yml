@@ -6,7 +6,7 @@ on:
       tenant_name:
         description: "DuploCloud tenant name (e.g. mj1)"
         required: true
-        default: "mj1"
+        default: "mj5"
       service_prefix:
         description: "Service name prefix (e.g. serv)"
         required: false
