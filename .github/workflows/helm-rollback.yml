@@ -1,0 +1,70 @@
+name: Helm Multi-Services – Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Helm revision to roll back to (leave blank for previous)"
+        required: false
+        default: ""
+
+env:
+  DUPLO_HOST: https://perf.duplocloud.net
+  DUPLO_TENANT: mj4
+  FLUX_NAMESPACE: duploservices-mj4
+
+jobs:
+  rollback:
+    name: Rollback multi-services in mj4
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Build kubeconfig for mj4
+        run: |
+          pip install duplocloud-client -q
+
+          duploctl --host ${{ env.DUPLO_HOST }} \
+            --token ${{ secrets.DUPLO_TOKEN }} \
+            --tenant ${{ env.DUPLO_TENANT }} \
+            jit k8s > /tmp/cred.json
+
+          SERVER=$(python3 -c "import json; d=json.load(open('/tmp/cred.json')); print(d['spec']['cluster']['server'])")
+          CA_DATA=$(python3 -c "import json; d=json.load(open('/tmp/cred.json')); print(d['spec']['cluster']['certificate-authority-data'])")
+          TOKEN=$(python3 -c "import json; d=json.load(open('/tmp/cred.json')); print(d['status']['token'])")
+
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+          echo "$CA_DATA" | base64 -d > /tmp/ca.crt
+          kubectl config set-cluster mj4-cluster --server="$SERVER" \
+            --certificate-authority=/tmp/ca.crt --embed-certs=true
+          kubectl config set-credentials mj4-user --token="$TOKEN"
+          kubectl config set-context mj4 --cluster=mj4-cluster \
+            --user=mj4-user --namespace=${{ env.FLUX_NAMESPACE }}
+          kubectl config use-context mj4
+
+          echo "KUBECONFIG=/tmp/kubeconfig.yaml" >> $GITHUB_ENV
+
+      - name: Show Helm history
+        run: helm history multi-services -n ${{ env.FLUX_NAMESPACE }}
+
+      - name: Rollback
+        run: |
+          REVISION="${{ github.event.inputs.revision }}"
+          if [ -n "$REVISION" ]; then
+            helm rollback multi-services "$REVISION" -n ${{ env.FLUX_NAMESPACE }} --wait --timeout=180s
+          else
+            helm rollback multi-services -n ${{ env.FLUX_NAMESPACE }} --wait --timeout=180s
+          fi
+
+      - name: Rollback summary
+        run: |
+          echo "=== Helm release ==="
+          helm list -n ${{ env.FLUX_NAMESPACE }}
+          echo ""
+          echo "=== Deployments ==="
+          kubectl get deployments -n ${{ env.FLUX_NAMESPACE }} --no-headers | grep -v chartmuseum
