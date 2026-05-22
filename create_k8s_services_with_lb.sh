@@ -70,7 +70,7 @@ duplo_post() {
   local body="$2"
   local response http_code body_out
 
-  response=$(curl -sf -w "\n%{http_code}" \
+  response=$(curl -s -w "\n%{http_code}" \
     -X POST "${DUPLO_HOST}/${path}" \
     -H "Authorization: Bearer ${DUPLO_TOKEN}" \
     -H "Content-Type: application/json" \

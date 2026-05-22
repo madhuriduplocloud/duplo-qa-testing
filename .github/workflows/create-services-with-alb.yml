@@ -60,7 +60,14 @@ jobs:
           token   = os.environ["DUPLO_TOKEN"]
           headers = {"Authorization": f"Bearer {token}"}
           r = requests.get(f"{host}/admin/GetTenantsForUser", headers=headers, timeout=30)
-          for t in r.json():
+          if not r.ok:
+              print(f"API error {r.status_code}: {r.text}", file=sys.stderr)
+              sys.exit(1)
+          data = r.json()
+          if not isinstance(data, list):
+              print(f"Unexpected response (expected list): {data}", file=sys.stderr)
+              sys.exit(1)
+          for t in data:
               if t.get("AccountName", "").lower() == tenant:
                   print(t["TenantId"])
                   sys.exit(0)
