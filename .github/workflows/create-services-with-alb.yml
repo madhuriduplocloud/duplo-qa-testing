@@ -1,0 +1,97 @@
+name: Create K8s Services with ALB
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_name:
+        description: "DuploCloud tenant name (e.g. mj1)"
+        required: true
+        default: "mj1"
+      service_prefix:
+        description: "Service name prefix (e.g. serv)"
+        required: false
+        default: "serv"
+      service_count:
+        description: "Number of services to create"
+        required: false
+        default: "20"
+      image:
+        description: "Container image"
+        required: false
+        default: "nginx:alpine"
+      container_port:
+        description: "Container port"
+        required: false
+        default: "80"
+      external_port:
+        description: "ALB external port"
+        required: false
+        default: "443"
+      protocol:
+        description: "ALB protocol (https or http)"
+        required: false
+        default: "https"
+      delete_mode:
+        description: "Set to 'true' to delete instead of create"
+        required: false
+        default: "false"
+
+env:
+  DUPLO_HOST: https://perf.duplocloud.net
+  CERT_ARN: arn:aws:acm:us-east-2:309617244960:certificate/e48470c9-502b-48e4-9e08-acd376b39741
+
+jobs:
+  create-services:
+    name: ${{ github.event.inputs.delete_mode == 'true' && 'Delete' || 'Create' }} ${{ github.event.inputs.service_count }} services in ${{ github.event.inputs.tenant_name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Resolve Tenant ID from DuploCloud API ─────────────────────────────────
+      - name: Resolve Tenant ID
+        id: tenant
+        run: |
+          TENANT_ID=$(python3 - <<'PY'
+          import os, requests, sys
+          host    = os.environ["DUPLO_HOST"]
+          tenant  = os.environ["TENANT_NAME"].lower()
+          token   = os.environ["DUPLO_TOKEN"]
+          headers = {"Authorization": f"Bearer {token}"}
+          r = requests.get(f"{host}/admin/GetTenantsForUser", headers=headers, timeout=30)
+          for t in r.json():
+              if t.get("AccountName", "").lower() == tenant:
+                  print(t["TenantId"])
+                  sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr)
+          sys.exit(1)
+          PY
+          )
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "Tenant: ${{ github.event.inputs.tenant_name }} → $TENANT_ID"
+        env:
+          TENANT_NAME: ${{ github.event.inputs.tenant_name }}
+          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+
+      # ── Run the service creation script ───────────────────────────────────────
+      - name: ${{ github.event.inputs.delete_mode == 'true' && 'Delete services' || 'Create services with ALB' }}
+        run: |
+          chmod +x ./create_k8s_services_with_lb.sh
+
+          if [ "${{ github.event.inputs.delete_mode }}" == "true" ]; then
+            ./create_k8s_services_with_lb.sh --delete
+          else
+            ./create_k8s_services_with_lb.sh
+          fi
+        env:
+          DUPLO_HOST:     ${{ env.DUPLO_HOST }}
+          DUPLO_TOKEN:    ${{ secrets.DUPLO_TOKEN }}
+          TENANT_ID:      ${{ steps.tenant.outputs.tenant_id }}
+          CERT_ARN:       ${{ env.CERT_ARN }}
+          SERVICE_PREFIX: ${{ github.event.inputs.service_prefix }}
+          SERVICE_COUNT:  ${{ github.event.inputs.service_count }}
+          IMAGE:          ${{ github.event.inputs.image }}
+          CONTAINER_PORT: ${{ github.event.inputs.container_port }}
+          EXTERNAL_PORT:  ${{ github.event.inputs.external_port }}
+          PROTOCOL:       ${{ github.event.inputs.protocol }}
