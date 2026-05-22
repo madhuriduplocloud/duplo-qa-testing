@@ -433,22 +433,28 @@ except:
 
   # Check if RDS already exists
   print_subsection "0.2  Check for Existing RDS"
+  local cluster_already_exists=false
   local existing
   existing=$(aws_rds_direct describe-db-clusters \
     --region "$AWS_REGION" \
     --query "DBClusters[?contains(DBClusterIdentifier,\`${RDS_IDENTIFIER}\`)].{ID:DBClusterIdentifier,Status:Status}" \
     --output json 2>/dev/null || echo "[]")
 
+  # DuploCloud names: instance=duplo{name}, cluster=duplo{name}-cluster
+  local cluster_id="duplo${RDS_IDENTIFIER}-cluster"
+  local instance_id="duplo${RDS_IDENTIFIER}"
+
   if echo "$existing" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0) if d else exit(1)" 2>/dev/null; then
     local existing_id
     existing_id=$(echo "$existing" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['ID'])" 2>/dev/null)
     local existing_status
     existing_status=$(echo "$existing" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['Status'])" 2>/dev/null)
-    record_check "WARN" "RDS cluster already exists — skipping creation" "ID: $existing_id  Status: $existing_status"
-    info "  Use existing cluster: $existing_id"
-    return 0
+    record_check "INFO" "RDS cluster already exists — will verify parameter group sync" "ID: $existing_id  Status: $existing_status"
+    info "  Using existing cluster: $existing_id — skipping creation, proceeding to parameter group setup"
+    cluster_already_exists=true
+  else
+    record_check "INFO" "No existing cluster found — proceeding with creation" ""
   fi
-  record_check "INFO" "No existing cluster found — proceeding with creation" ""
 
   # ── Prerequisite: custom cluster parameter group with logical replication ──
   print_subsection "0.3  Create Cluster Parameter Group (Blue/Green prerequisite)"
@@ -494,6 +500,8 @@ except:
     record_check "FAIL" "Failed to set rds.logical_replication in parameter group" "$pg_mod_out"
     return 1
   fi
+
+  if [[ "$cluster_already_exists" == "false" ]]; then
 
   # Create via DuploCloud API
   print_subsection "0.4  Create Aurora PostgreSQL db.t3.medium via DuploCloud API"
@@ -553,9 +561,7 @@ except:
   fi
 
   # Wait for cluster to become available
-  # DuploCloud names instances as duplo{name}, clusters as duplo{name}-cluster
   print_subsection "0.5  Wait for Cluster to Become Available"
-  local cluster_id="duplo${RDS_IDENTIFIER}-cluster"
   info "  Polling cluster: $cluster_id (up to 15 min)"
 
   local elapsed=0
@@ -583,9 +589,7 @@ except:
   fi
 
   # Wait for instance
-  # DuploCloud names the instance as duplo{name} (not duplo{name}-cluster-1)
   print_subsection "0.6  Wait for Instance to Become Available"
-  local instance_id="duplo${RDS_IDENTIFIER}"
   elapsed=0
   while (( elapsed < max_wait )); do
     local inst_status
@@ -615,63 +619,86 @@ except:
     record_check "WARN" "Instance did not become available within ${max_wait}s — check AWS console" ""
   fi
 
+  fi # end: if cluster_already_exists == false
+
   # Apply parameter group to cluster and reboot instance
   # DuploCloud's API ignores DBClusterParameterGroupName, so we must apply it post-creation.
+  # Also runs when reusing an existing cluster, to ensure the parameter group is in-sync.
   print_subsection "0.7  Apply Parameter Group and Enable Logical Replication"
-  info "  Applying $pg_name to cluster $cluster_id..."
 
-  local modify_out
-  modify_out=$(aws_rds_direct modify-db-cluster \
+  # Check current state: if parameter group is already applied and in-sync, skip reboot
+  local current_pg pg_sync_status
+  current_pg=$(aws_rds_direct describe-db-clusters \
     --region "$AWS_REGION" \
     --db-cluster-identifier "$cluster_id" \
-    --db-cluster-parameter-group-name "$pg_name" \
-    --apply-immediately \
-    --output json 2>&1) || true
-
-  if echo "$modify_out" | grep -q '"DBClusterIdentifier"'; then
-    record_check "PASS" "Cluster parameter group updated to $pg_name" ""
-  else
-    record_check "FAIL" "Failed to apply parameter group to cluster" "$modify_out"
-    return 1
-  fi
-
-  info "  Rebooting instance $instance_id to apply rds.logical_replication=1..."
-  local reboot_out
-  reboot_out=$(aws_rds_direct reboot-db-instance \
+    --query 'DBClusters[0].DBClusterParameterGroup' \
+    --output text 2>/dev/null || echo "unknown")
+  pg_sync_status=$(aws_rds_direct describe-db-instances \
     --region "$AWS_REGION" \
     --db-instance-identifier "$instance_id" \
-    --output json 2>&1) || true
+    --query 'DBInstances[0].DBClusterParameterGroups[0].DBClusterParameterGroupStatus' \
+    --output text 2>/dev/null || echo "unknown")
 
-  if echo "$reboot_out" | grep -q '"DBInstanceIdentifier"'; then
-    record_check "PASS" "Instance reboot initiated" ""
+  info "  Current cluster parameter group : $current_pg"
+  info "  Current instance PG sync status : $pg_sync_status"
+
+  if [[ "$current_pg" == "$pg_name" && "$pg_sync_status" == "in-sync" ]]; then
+    record_check "PASS" "Parameter group $pg_name already applied and in-sync — no reboot needed" ""
   else
-    record_check "WARN" "Reboot initiation unclear — checking instance status" "$reboot_out"
-  fi
+    info "  Applying $pg_name to cluster $cluster_id..."
+    local modify_out
+    modify_out=$(aws_rds_direct modify-db-cluster \
+      --region "$AWS_REGION" \
+      --db-cluster-identifier "$cluster_id" \
+      --db-cluster-parameter-group-name "$pg_name" \
+      --apply-immediately \
+      --output json 2>&1) || true
 
-  info "  Waiting for instance to return to available after reboot (up to 10 min)..."
-  elapsed=0
-  local max_reboot=600
-  while (( elapsed < max_reboot )); do
-    local inst_status
-    inst_status=$(aws_rds_direct describe-db-instances \
+    if echo "$modify_out" | grep -q '"DBClusterIdentifier"'; then
+      record_check "PASS" "Cluster parameter group updated to $pg_name" ""
+    else
+      record_check "FAIL" "Failed to apply parameter group to cluster" "$modify_out"
+      return 1
+    fi
+
+    info "  Rebooting instance $instance_id to apply rds.logical_replication=1..."
+    local reboot_out
+    reboot_out=$(aws_rds_direct reboot-db-instance \
       --region "$AWS_REGION" \
       --db-instance-identifier "$instance_id" \
-      --query 'DBInstances[0].DBInstanceStatus' \
-      --output text 2>/dev/null || echo "not-found")
+      --output json 2>&1) || true
 
-    info "  [${elapsed}s] Instance status: $inst_status"
-
-    if [[ "$inst_status" == "available" ]]; then
-      record_check "PASS" "Instance available after reboot" ""
-      break
+    if echo "$reboot_out" | grep -q '"DBInstanceIdentifier"'; then
+      record_check "PASS" "Instance reboot initiated" ""
+    else
+      record_check "WARN" "Reboot initiation unclear — checking instance status" "$reboot_out"
     fi
-    sleep 30
-    elapsed=$((elapsed+30))
-  done
 
-  if (( elapsed >= max_reboot )); then
-    record_check "WARN" "Instance did not return to available within ${max_reboot}s after reboot" ""
-  fi
+    info "  Waiting for instance to return to available after reboot (up to 10 min)..."
+    elapsed=0
+    local max_reboot=600
+    while (( elapsed < max_reboot )); do
+      local inst_status
+      inst_status=$(aws_rds_direct describe-db-instances \
+        --region "$AWS_REGION" \
+        --db-instance-identifier "$instance_id" \
+        --query 'DBInstances[0].DBInstanceStatus' \
+        --output text 2>/dev/null || echo "not-found")
+
+      info "  [${elapsed}s] Instance status: $inst_status"
+
+      if [[ "$inst_status" == "available" ]]; then
+        record_check "PASS" "Instance available after reboot" ""
+        break
+      fi
+      sleep 30
+      elapsed=$((elapsed+30))
+    done
+
+    if (( elapsed >= max_reboot )); then
+      record_check "WARN" "Instance did not return to available within ${max_reboot}s after reboot" ""
+    fi
+  fi # end: if parameter group not already in-sync
 
   # Verify logical replication is enabled
   local lr_val
