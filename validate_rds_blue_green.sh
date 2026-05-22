@@ -28,6 +28,21 @@ DB_PORT="5432"
 DB_SCHEMA="public"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 LAG_THRESHOLD=30          # seconds
+
+# DuploCloud auth (auto-populated by get_duplo_token_from_aws_config)
+AWS_PROFILE_NAME="${AWS_PROFILE:-}"
+DUPLO_HOST=""
+DUPLO_BEARER_TOKEN=""
+
+# RDS creation (optional Phase 0)
+CREATE_RDS=false
+RDS_IDENTIFIER="pg-serverless"
+RDS_MASTER_USER="pgadmin"
+RDS_MASTER_PASSWORD=""
+RDS_ENGINE_VERSION="16.6"
+RDS_MIN_ACU="0.5"
+RDS_MAX_ACU="8"
+DUPLO_TENANT=""
 MONITOR_DURATION=3600     # 60 minutes
 MONITOR_INTERVAL=60       # seconds
 PHASE="all"
@@ -78,6 +93,17 @@ ${BOLD}OPTIONAL FLAGS:${RESET}
   --monitor-interval SECS  Phase 3 poll interval   (default: 60)
   --phase PHASE            Phase to run: pre|post|monitor|post+monitor|all (default: all)
   --report-dir DIR         Directory for reports   (default: /tmp/rds_bg_reports)
+  --aws-profile PROFILE    AWS profile from ~/.aws/config (used to auto-derive DuploCloud token)
+  --duplo-host HOST        DuploCloud host URL (auto-detected from ~/.aws/config if --aws-profile set)
+  --duplo-token TOKEN      DuploCloud bearer token (overrides auto-detection)
+  --duplo-tenant NAME      DuploCloud tenant name (required for --create-rds)
+  --create-rds             Phase 0: create Aurora PostgreSQL Serverless v2 before validation
+  --rds-identifier NAME    RDS identifier name (default: pg-serverless)
+  --rds-master-user USER   Master username      (default: pgadmin)
+  --rds-master-pass PASS   Master password      (required if --create-rds)
+  --rds-engine-version VER Engine version       (default: 16.6)
+  --rds-min-acu NUM        Serverless min ACU   (default: 0.5)
+  --rds-max-acu NUM        Serverless max ACU   (default: 8)
 
 ${BOLD}PHASES:${RESET}
   pre          Phase 1: Pre-switchover checks
@@ -89,12 +115,27 @@ ${BOLD}PHASES:${RESET}
 ${BOLD}ENVIRONMENT:${RESET}
   AWS_REGION        AWS region (overridden by --region)
   PGPASSWORD        PostgreSQL password (required for DB checks; skipped if unset)
-  AWS_PROFILE       AWS CLI profile (optional)
+  AWS_PROFILE       AWS profile (overridden by --aws-profile)
+  DUPLO_TOKEN       DuploCloud bearer token (overridden by --duplo-token)
+
+${BOLD}TOKEN AUTO-DETECTION:${RESET}
+  When --aws-profile is provided, the script reads ~/.aws/config, extracts the
+  credential_process line for that profile, parses out --host and --token values,
+  then calls 'duplo-jit duplo --host <host> --token <token>' to obtain the
+  DuploCloud API bearer token automatically. No manual token setup needed.
 
 ${BOLD}EXAMPLES:${RESET}
-  # Run pre-switchover checks
-  PGPASSWORD=secret $0 --blue-instance mydb-blue --green-instance mydb-green \\
+  # Auto-detect DuploCloud token from ~/.aws/config and create RDS before validation
+  PGPASSWORD=secret $0 \\
+    --aws-profile oneclick --duplo-tenant maja2205 \\
+    --create-rds --rds-master-pass MyPass123 \\
+    --blue-instance duploservices-maja2205-pg-serverless-1 \\
+    --green-instance duploservices-maja2205-pg-serverless-2 \\
     --deployment-id bgd-abc123 --phase pre
+
+  # Run pre-switchover checks with explicit token
+  PGPASSWORD=secret $0 --blue-instance mydb-blue --green-instance mydb-green \\
+    --deployment-id bgd-abc123 --duplo-token <token> --phase pre
 
   # Run post-switchover checks + monitoring
   PGPASSWORD=secret $0 --blue-instance mydb-blue --green-instance mydb-green \\
@@ -122,15 +163,28 @@ while [[ $# -gt 0 ]]; do
     --monitor-duration)  MONITOR_DURATION="$2"; shift 2 ;;
     --monitor-interval)  MONITOR_INTERVAL="$2"; shift 2 ;;
     --phase)             PHASE="$2";            shift 2 ;;
-    --report-dir)        REPORT_DIR="$2";       shift 2 ;;
+    --report-dir)          REPORT_DIR="$2";           shift 2 ;;
+    --aws-profile)         AWS_PROFILE_NAME="$2";     shift 2 ;;
+    --duplo-host)          DUPLO_HOST="$2";            shift 2 ;;
+    --duplo-token)         DUPLO_BEARER_TOKEN="$2";   shift 2 ;;
+    --duplo-tenant)        DUPLO_TENANT="$2";          shift 2 ;;
+    --create-rds)          CREATE_RDS=true;            shift   ;;
+    --rds-identifier)      RDS_IDENTIFIER="$2";        shift 2 ;;
+    --rds-master-user)     RDS_MASTER_USER="$2";       shift 2 ;;
+    --rds-master-pass)     RDS_MASTER_PASSWORD="$2";   shift 2 ;;
+    --rds-engine-version)  RDS_ENGINE_VERSION="$2";    shift 2 ;;
+    --rds-min-acu)         RDS_MIN_ACU="$2";           shift 2 ;;
+    --rds-max-acu)         RDS_MAX_ACU="$2";           shift 2 ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
 done
 
-# Validate required args
-if [[ -z "$BLUE_INSTANCE" || -z "$GREEN_INSTANCE" || -z "$DEPLOYMENT_ID" ]]; then
-  echo -e "${RED}ERROR: --blue-instance, --green-instance, and --deployment-id are required.${RESET}"
-  usage
+# Validate required args (only required when not just creating RDS)
+if [[ "$CREATE_RDS" != "true" ]]; then
+  if [[ -z "$BLUE_INSTANCE" || -z "$GREEN_INSTANCE" || -z "$DEPLOYMENT_ID" ]]; then
+    echo -e "${RED}ERROR: --blue-instance, --green-instance, and --deployment-id are required.${RESET}"
+    usage
+  fi
 fi
 
 # Recreate report dir in case --report-dir was overridden
@@ -188,6 +242,329 @@ info() {
 warn_msg() {
   echo -e "${YELLOW}WARN: $*${RESET}"
   log_to_file "WARN: $*"
+}
+
+# ---------------------------------------------------------------------------
+# DUPLOCLOUD TOKEN AUTO-DETECTION FROM ~/.aws/config
+# ---------------------------------------------------------------------------
+# Reads ~/.aws/config for the given AWS profile, extracts --host and --token
+# from the credential_process line, then calls duplo-jit to obtain a live
+# DuploCloud API bearer token. Sets DUPLO_HOST and DUPLO_BEARER_TOKEN globals.
+# ---------------------------------------------------------------------------
+get_duplo_token_from_aws_config() {
+  local profile="${1:-${AWS_PROFILE_NAME:-}}"
+  local aws_config="${HOME}/.aws/config"
+
+  if [[ -z "$profile" ]]; then
+    warn_msg "No --aws-profile specified; skipping DuploCloud token auto-detection"
+    return 0
+  fi
+
+  if [[ ! -f "$aws_config" ]]; then
+    warn_msg "~/.aws/config not found; cannot auto-detect DuploCloud token"
+    return 0
+  fi
+
+  info "Extracting DuploCloud token from ~/.aws/config profile: $profile"
+
+  # Parse the credential_process line for this profile
+  local cred_process
+  cred_process=$(python3 - "$aws_config" "$profile" <<'PYEOF'
+import sys, configparser, re
+cfg_file, profile = sys.argv[1], sys.argv[2]
+cp = configparser.ConfigParser()
+cp.read(cfg_file)
+section = f"profile {profile}"
+if section not in cp and profile == "default":
+    section = "default"
+if section not in cp:
+    print("")
+    sys.exit(0)
+print(cp[section].get("credential_process", ""))
+PYEOF
+  )
+
+  if [[ -z "$cred_process" ]]; then
+    warn_msg "No credential_process found for profile '$profile' in ~/.aws/config"
+    return 0
+  fi
+
+  info "  credential_process: $cred_process"
+
+  # Extract --host value
+  local duplo_host
+  duplo_host=$(echo "$cred_process" | grep -oE '\-\-host [^ ]+' | awk '{print $2}' | head -1)
+
+  # Extract --token value
+  local encrypted_token
+  encrypted_token=$(echo "$cred_process" | grep -oE '\-\-token [^ ]+' | awk '{print $2}' | head -1)
+
+  if [[ -z "$duplo_host" ]]; then
+    warn_msg "Could not parse --host from credential_process for profile '$profile'"
+    return 0
+  fi
+
+  if [[ -z "$encrypted_token" ]]; then
+    warn_msg "No --token in credential_process for profile '$profile' (may use --interactive); skipping auto-detection"
+    return 0
+  fi
+
+  # Set DUPLO_HOST if not already set
+  [[ -z "$DUPLO_HOST" ]] && DUPLO_HOST="$duplo_host"
+  info "  DuploCloud host: $DUPLO_HOST"
+
+  # Check duplo-jit is available
+  if ! command -v duplo-jit &>/dev/null; then
+    warn_msg "duplo-jit not found in PATH; cannot auto-detect DuploCloud bearer token"
+    return 0
+  fi
+
+  # Call duplo-jit duplo to exchange the encrypted token for a DuploCloud bearer token
+  local raw_output
+  raw_output=$(duplo-jit duplo --host "$DUPLO_HOST" --token "$encrypted_token" 2>/dev/null || true)
+
+  if [[ -z "$raw_output" ]]; then
+    warn_msg "duplo-jit duplo returned empty output for profile '$profile'"
+    return 0
+  fi
+
+  # duplo-jit duplo returns JSON: {"Version":1,"DuploToken":"..."}
+  local bearer
+  bearer=$(echo "$raw_output" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data.get('DuploToken', ''))
+except Exception:
+    print(sys.stdin.read().strip())
+" 2>/dev/null || true)
+
+  if [[ -z "$bearer" ]]; then
+    warn_msg "Could not extract DuploToken from duplo-jit output"
+    return 0
+  fi
+
+  DUPLO_BEARER_TOKEN="$bearer"
+  info "  DuploCloud bearer token obtained (length: ${#DUPLO_BEARER_TOKEN})"
+}
+
+# Call token auto-detection early if --aws-profile was provided
+# (explicit --duplo-token always wins)
+if [[ -z "$DUPLO_BEARER_TOKEN" && -n "$AWS_PROFILE_NAME" ]]; then
+  get_duplo_token_from_aws_config "$AWS_PROFILE_NAME"
+fi
+
+# Also honour DUPLO_TOKEN env var as fallback
+[[ -z "$DUPLO_BEARER_TOKEN" && -n "${DUPLO_TOKEN:-}" ]] && DUPLO_BEARER_TOKEN="$DUPLO_TOKEN"
+
+# ---------------------------------------------------------------------------
+# DUPLOCLOUD API HELPER
+# ---------------------------------------------------------------------------
+duplo_api() {
+  local method="${1:-GET}"
+  local path="$2"
+  local body="${3:-}"
+  local url="${DUPLO_HOST}${path}"
+
+  if [[ -z "$DUPLO_BEARER_TOKEN" || -z "$DUPLO_HOST" ]]; then
+    echo ""
+    return 1
+  fi
+
+  if [[ -n "$body" ]]; then
+    curl -s --max-time 30 -X "$method" \
+      -H "Authorization: Bearer $DUPLO_BEARER_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$body" "$url" 2>/dev/null || true
+  else
+    curl -s --max-time 30 -X "$method" \
+      -H "Authorization: Bearer $DUPLO_BEARER_TOKEN" \
+      "$url" 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 0 — RDS CREATION (optional, triggered by --create-rds)
+# Creates an Aurora PostgreSQL Serverless v2 cluster+instance via DuploCloud
+# API so the resource is managed by DuploCloud (not auto-deleted).
+# ---------------------------------------------------------------------------
+phase0_create_rds() {
+  print_section "PHASE 0 — RDS CREATION (Aurora PostgreSQL Serverless v2)"
+
+  if [[ -z "$DUPLO_TENANT" ]]; then
+    record_check "FAIL" "Phase 0: --duplo-tenant is required for RDS creation" ""
+    return 1
+  fi
+
+  if [[ -z "$RDS_MASTER_PASSWORD" ]]; then
+    record_check "FAIL" "Phase 0: --rds-master-pass is required for RDS creation" ""
+    return 1
+  fi
+
+  if [[ -z "$DUPLO_BEARER_TOKEN" ]]; then
+    record_check "FAIL" "Phase 0: No DuploCloud bearer token available. Provide --aws-profile or --duplo-token." ""
+    return 1
+  fi
+
+  # Resolve tenant ID
+  print_subsection "0.1  Resolve Tenant ID"
+  local tenant_id
+  tenant_id=$(duplo_api GET "/v3/admin/tenant" | python3 -c "
+import json, sys
+try:
+    tenants = json.load(sys.stdin)
+    for t in tenants:
+        if t.get('AccountName','').lower() == '${DUPLO_TENANT}'.lower():
+            print(t['TenantId'])
+            break
+except:
+    pass
+" 2>/dev/null || true)
+
+  if [[ -z "$tenant_id" ]]; then
+    record_check "FAIL" "Could not resolve tenant ID for '$DUPLO_TENANT'" "Check --duplo-tenant name and token permissions"
+    return 1
+  fi
+  record_check "PASS" "Tenant '$DUPLO_TENANT' resolved" "TenantId: $tenant_id"
+
+  # Check if RDS already exists
+  print_subsection "0.2  Check for Existing RDS"
+  local existing
+  existing=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-clusters \
+    --region "$AWS_REGION" \
+    --query "DBClusters[?contains(DBClusterIdentifier,\`${RDS_IDENTIFIER}\`)].{ID:DBClusterIdentifier,Status:Status}" \
+    --output json 2>/dev/null || echo "[]")
+
+  if echo "$existing" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0) if d else exit(1)" 2>/dev/null; then
+    local existing_id
+    existing_id=$(echo "$existing" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['ID'])" 2>/dev/null)
+    local existing_status
+    existing_status=$(echo "$existing" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['Status'])" 2>/dev/null)
+    record_check "WARN" "RDS cluster already exists — skipping creation" "ID: $existing_id  Status: $existing_status"
+    info "  Use existing cluster: $existing_id"
+    return 0
+  fi
+  record_check "INFO" "No existing cluster found — proceeding with creation" ""
+
+  # Create via DuploCloud API
+  print_subsection "0.3  Create Aurora PostgreSQL Serverless v2 via DuploCloud API"
+  info "  Tenant:         $DUPLO_TENANT ($tenant_id)"
+  info "  Identifier:     duploservices-${DUPLO_TENANT}-${RDS_IDENTIFIER}"
+  info "  Engine:         aurora-postgresql $RDS_ENGINE_VERSION"
+  info "  Instance class: db.serverless (ACU: $RDS_MIN_ACU – $RDS_MAX_ACU)"
+  info "  Region:         $AWS_REGION"
+
+  local payload
+  payload=$(cat <<PAYLOAD
+{
+  "Identifier": "${RDS_IDENTIFIER}",
+  "Engine": "aurora-postgresql",
+  "EngineVersion": "${RDS_ENGINE_VERSION}",
+  "DBInstanceClass": "db.serverless",
+  "MasterUsername": "${RDS_MASTER_USER}",
+  "MasterUserPassword": "${RDS_MASTER_PASSWORD}",
+  "EncryptStorage": true,
+  "BackupRetentionPeriod": 7,
+  "MultiAZ": false,
+  "ServerlessV2ScalingConfiguration": {
+    "MinCapacity": ${RDS_MIN_ACU},
+    "MaxCapacity": ${RDS_MAX_ACU}
+  }
+}
+PAYLOAD
+  )
+
+  local response
+  response=$(duplo_api POST "/subscriptions/${tenant_id}/rds-db" "$payload")
+  local http_check
+  http_check=$(echo "$response" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    msg=d.get('Message','')
+    if 'error' in msg.lower() or 'denied' in msg.lower() or 'invalid' in msg.lower():
+        print('ERROR:' + msg)
+    else:
+        print('OK')
+except:
+    print('OK')
+" 2>/dev/null || echo "OK")
+
+  if [[ "$http_check" == OK ]]; then
+    record_check "PASS" "RDS creation request accepted by DuploCloud" ""
+    info "  Response: ${response:0:200}"
+  else
+    record_check "FAIL" "RDS creation failed" "$http_check"
+    info "  Response: $response"
+    return 1
+  fi
+
+  # Wait for cluster to become available
+  print_subsection "0.4  Wait for Cluster to Become Available"
+  local cluster_id="duploservices-${DUPLO_TENANT}-${RDS_IDENTIFIER}"
+  info "  Polling cluster: $cluster_id (up to 15 min)"
+
+  local elapsed=0
+  local max_wait=900
+  while (( elapsed < max_wait )); do
+    local status
+    status=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-clusters \
+      --region "$AWS_REGION" \
+      --db-cluster-identifier "$cluster_id" \
+      --query 'DBClusters[0].Status' \
+      --output text 2>/dev/null || echo "not-found")
+
+    info "  [${elapsed}s] Cluster status: $status"
+
+    if [[ "$status" == "available" ]]; then
+      record_check "PASS" "Aurora cluster is available" "ID: $cluster_id"
+      break
+    fi
+    sleep 30
+    (( elapsed += 30 ))
+  done
+
+  if (( elapsed >= max_wait )); then
+    record_check "WARN" "Cluster did not become available within ${max_wait}s — check AWS console" ""
+  fi
+
+  # Wait for instance
+  print_subsection "0.5  Wait for Instance to Become Available"
+  local instance_id="${cluster_id}-1"
+  elapsed=0
+  while (( elapsed < max_wait )); do
+    local inst_status
+    inst_status=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-instances \
+      --region "$AWS_REGION" \
+      --db-instance-identifier "$instance_id" \
+      --query 'DBInstances[0].DBInstanceStatus' \
+      --output text 2>/dev/null || echo "not-found")
+
+    info "  [${elapsed}s] Instance status: $inst_status"
+
+    if [[ "$inst_status" == "available" ]]; then
+      local ep
+      ep=$(AWS_PROFILE="${AWS_PROFILE_NAME:-default}" aws rds describe-db-clusters \
+        --region "$AWS_REGION" \
+        --db-cluster-identifier "$cluster_id" \
+        --query 'DBClusters[0].Endpoint' \
+        --output text 2>/dev/null || echo "unknown")
+      record_check "PASS" "Aurora instance is available" "Instance: $instance_id  Endpoint: $ep"
+      info ""
+      info "  ✓ RDS cluster ready for Blue/Green deployment setup:"
+      info "    Cluster ID  : $cluster_id"
+      info "    Instance ID : $instance_id"
+      info "    Endpoint    : $ep"
+      info "    Port        : 5432"
+      break
+    fi
+    sleep 30
+    (( elapsed += 30 ))
+  done
+
+  if (( elapsed >= max_wait )); then
+    record_check "WARN" "Instance did not become available within ${max_wait}s — check AWS console" ""
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1960,6 +2337,11 @@ PYEOF
 
 main() {
   print_header
+
+  # Phase 0: optional RDS creation (runs before any validation phase)
+  if [[ "$CREATE_RDS" == "true" ]]; then
+    phase0_create_rds
+  fi
 
   case "$PHASE" in
     pre)
