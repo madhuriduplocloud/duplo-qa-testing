@@ -1,0 +1,48 @@
+name: OneClick Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant:
+        description: DuploCloud tenant name
+        required: true
+        default: "maja2205"
+      service:
+        description: Service name to deploy/test
+        required: false
+        default: ""
+      image:
+        description: Docker image URI
+        required: false
+        default: ""
+      wait:
+        description: Wait for deployment to complete
+        required: false
+        default: "true"
+
+jobs:
+  oneclick-test:
+    runs-on: ubuntu-latest
+    environment: qa-aws
+    env:
+      DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+      DUPLO_HOST: ${{ vars.DUPLO_HOST }}
+      DUPLO_TENANT: ${{ inputs.tenant }}
+    steps:
+      - name: Duplo Setup AWS
+        uses: duplocloud/actions@node24-upgrade
+        with:
+          region: ${{ vars.AWS_REGION }}
+
+      - name: OneClick Deploy
+        if: ${{ inputs.service != '' && inputs.image != '' }}
+        uses: duplocloud/actions/update-service@node24-upgrade
+        with:
+          service: ${{ inputs.service }}
+          image: ${{ inputs.image }}
+          wait: ${{ inputs.wait }}
+
+      - name: Verify Tenant Health
+        uses: duplocloud/actions/tenant-health@node24-upgrade
+        with:
+          tenant: ${{ inputs.tenant }}
