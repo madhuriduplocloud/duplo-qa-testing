@@ -104,42 +104,26 @@ jobs:
         run: |
           pip install duplocloud-client -q
 
-          # duploctl jit k8s returns ExecCredential JSON — write to temp file
+          # duploctl jit k8s returns ExecCredential JSON
           duploctl --host ${{ env.DUPLO_HOST }} \
             --token ${{ secrets.DUPLO_TOKEN }} \
             --tenant ${{ env.DUPLO_TENANT }} \
             jit k8s > /tmp/cred.json
 
-          # Parse ExecCredential and build static-token kubeconfig
-          python3 - <<PY
-          import json
-          cred   = json.load(open("/tmp/cred.json"))
-          server = cred["spec"]["cluster"]["server"]
-          ca     = cred["spec"]["cluster"]["certificate-authority-data"]
-          token  = cred["status"]["token"]
-          ns     = "${{ env.FLUX_NAMESPACE }}"
-          kubeconfig = f"""apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: {server}
-    certificate-authority-data: {ca}
-  name: mj4-cluster
-contexts:
-- context:
-    cluster: mj4-cluster
-    namespace: {ns}
-    user: mj4-user
-  name: mj4
-current-context: mj4
-users:
-- name: mj4-user
-  user:
-    token: {token}
-"""
-          open("/tmp/kubeconfig.yaml", "w").write(kubeconfig)
-          print("kubeconfig written successfully")
-          PY
+          # Parse fields
+          SERVER=$(python3 -c "import json; d=json.load(open('/tmp/cred.json')); print(d['spec']['cluster']['server'])")
+          CA_DATA=$(python3 -c "import json; d=json.load(open('/tmp/cred.json')); print(d['spec']['cluster']['certificate-authority-data'])")
+          TOKEN=$(python3 -c "import json; d=json.load(open('/tmp/cred.json')); print(d['status']['token'])")
+
+          # Build kubeconfig using kubectl config commands
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+          echo "$CA_DATA" | base64 -d > /tmp/ca.crt
+          kubectl config set-cluster mj4-cluster --server="$SERVER" \
+            --certificate-authority=/tmp/ca.crt --embed-certs=true
+          kubectl config set-credentials mj4-user --token="$TOKEN"
+          kubectl config set-context mj4 --cluster=mj4-cluster \
+            --user=mj4-user --namespace=${{ env.FLUX_NAMESPACE }}
+          kubectl config use-context mj4
 
           echo "KUBECONFIG=/tmp/kubeconfig.yaml" >> $GITHUB_ENV
           kubectl config current-context
