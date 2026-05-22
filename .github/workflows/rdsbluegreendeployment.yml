@@ -1,48 +1,256 @@
-name: OneClick Test
+name: RDS Blue/Green Deployment — Full E2E Validation
 
 on:
   workflow_dispatch:
     inputs:
       tenant:
-        description: DuploCloud tenant name
+        description: "DuploCloud tenant name"
         required: true
         default: "maja2205"
-      service:
-        description: Service name to deploy/test
+      rds_name:
+        description: "RDS short name (DuploCloud name, without duplo prefix)"
+        required: true
+        default: "maja-bgtest"
+      region:
+        description: "AWS region"
         required: false
-        default: ""
-      image:
-        description: Docker image URI
+        default: "us-east-2"
+      engine_version:
+        description: "Aurora PostgreSQL engine version"
         required: false
-        default: ""
-      wait:
-        description: Wait for deployment to complete
+        default: "16.6"
+      monitor_duration:
+        description: "Phase 3 monitoring duration in seconds (default 3600 = 60 min)"
         required: false
-        default: "true"
+        default: "3600"
+      monitor_interval:
+        description: "Phase 3 monitoring poll interval in seconds"
+        required: false
+        default: "60"
+      skip_rds_create:
+        description: "true = skip Phase 0, use existing RDS instance"
+        required: false
+        default: "false"
 
 jobs:
-  oneclick-test:
+  bluegreen-e2e:
     runs-on: ubuntu-latest
     environment: qa-aws
+    timeout-minutes: 150
+
     env:
-      DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-      DUPLO_HOST: ${{ vars.DUPLO_HOST }}
+      DUPLO_HOST:   ${{ vars.DUPLO_HOST }}
+      DUPLO_TOKEN:  ${{ secrets.DUPLO_TOKEN }}
+      PGPASSWORD:   ${{ secrets.PGPASSWORD }}
+      AWS_REGION:   ${{ inputs.region }}
       DUPLO_TENANT: ${{ inputs.tenant }}
+      RDS_NAME:     ${{ inputs.rds_name }}
+
     steps:
-      - name: Duplo Setup AWS
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client jq netcat-openbsd
+          pip install duploctl --quiet
+          chmod +x validate_rds_blue_green.sh
+
+      # -----------------------------------------------------------------------
+      - name: Setup AWS via DuploCloud
         uses: duplocloud/actions@node24-upgrade
         with:
-          region: ${{ vars.AWS_REGION }}
+          region: ${{ inputs.region }}
 
-      - name: OneClick Deploy
-        if: ${{ inputs.service != '' && inputs.image != '' }}
-        uses: duplocloud/actions/update-service@node24-upgrade
-        with:
-          service: ${{ inputs.service }}
-          image: ${{ inputs.image }}
-          wait: ${{ inputs.wait }}
+      # -----------------------------------------------------------------------
+      - name: Phase 0 — Create RDS Instance
+        if: inputs.skip_rds_create != 'true'
+        run: |
+          bash validate_rds_blue_green.sh \
+            --duplo-host    "$DUPLO_HOST"   \
+            --duplo-token   "$DUPLO_TOKEN"  \
+            --duplo-tenant  "$DUPLO_TENANT" \
+            --region        "$AWS_REGION"   \
+            --create-rds                    \
+            --rds-identifier    "$RDS_NAME" \
+            --rds-master-user   pgadmin     \
+            --rds-master-pass   "${{ secrets.RDS_MASTER_PASSWORD }}" \
+            --rds-engine-version "${{ inputs.engine_version }}"
 
-      - name: Verify Tenant Health
-        uses: duplocloud/actions/tenant-health@node24-upgrade
+      # -----------------------------------------------------------------------
+      - name: Resolve Blue instance and confirm available
+        id: resolve
+        run: |
+          BLUE_INSTANCE="duplo${RDS_NAME}"
+          echo "blue_instance=${BLUE_INSTANCE}" >> "$GITHUB_OUTPUT"
+          echo "Blue instance: ${BLUE_INSTANCE}"
+
+          # Wait up to 5 min if still provisioning
+          for i in $(seq 1 10); do
+            STATUS=$(aws rds describe-db-instances \
+              --db-instance-identifier "$BLUE_INSTANCE" \
+              --query 'DBInstances[0].DBInstanceStatus' \
+              --output text --region "$AWS_REGION" 2>/dev/null || echo "not-found")
+            echo "  [${i}] status: $STATUS"
+            [[ "$STATUS" == "available" ]] && break
+            [[ "$STATUS" == "not-found" ]] && { echo "ERROR: $BLUE_INSTANCE not found"; exit 1; }
+            sleep 30
+          done
+
+          if [[ "$STATUS" != "available" ]]; then
+            echo "ERROR: $BLUE_INSTANCE is not available (status: $STATUS)"
+            exit 1
+          fi
+
+          # Capture cluster identifier for Blue/Green creation
+          CLUSTER_ID=$(aws rds describe-db-instances \
+            --db-instance-identifier "$BLUE_INSTANCE" \
+            --query 'DBInstances[0].DBClusterIdentifier' \
+            --output text --region "$AWS_REGION")
+          echo "cluster_id=${CLUSTER_ID}" >> "$GITHUB_OUTPUT"
+          echo "Blue cluster: ${CLUSTER_ID}"
+
+      # -----------------------------------------------------------------------
+      - name: Create Blue/Green Deployment
+        id: create_bg
+        run: |
+          CLUSTER_ID="${{ steps.resolve.outputs.cluster_id }}"
+
+          # Get cluster ARN (required as --source)
+          CLUSTER_ARN=$(aws rds describe-db-clusters \
+            --db-cluster-identifier "$CLUSTER_ID" \
+            --query 'DBClusters[0].DBClusterArn' \
+            --output text --region "$AWS_REGION")
+          echo "Source cluster ARN: $CLUSTER_ARN"
+
+          # Create the Blue/Green deployment
+          BG_JSON=$(aws rds create-blue-green-deployment \
+            --blue-green-deployment-name "${RDS_NAME}-bg" \
+            --source "$CLUSTER_ARN" \
+            --region "$AWS_REGION" \
+            --output json)
+
+          DEPLOYMENT_ID=$(echo "$BG_JSON" | jq -r '.BlueGreenDeployment.BlueGreenDeploymentIdentifier')
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "Deployment created: $DEPLOYMENT_ID"
+
+          # Wait for AVAILABLE (up to 35 min, poll every 30s)
+          echo "Waiting for Blue/Green deployment to become AVAILABLE..."
+          for i in $(seq 1 70); do
+            STATUS=$(aws rds describe-blue-green-deployments \
+              --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+              --query 'BlueGreenDeployments[0].Status' \
+              --output text --region "$AWS_REGION" 2>/dev/null || echo "")
+            echo "  [$((i * 30))s] Status: $STATUS"
+            [[ "$STATUS" == "AVAILABLE" ]] && break
+            if [[ "$STATUS" == "INVALID_CONFIGURATION" || "$STATUS" == "CREATE_FAILED" ]]; then
+              echo "ERROR: Deployment failed — Status: $STATUS"
+              exit 1
+            fi
+            sleep 30
+          done
+
+          if [[ "$STATUS" != "AVAILABLE" ]]; then
+            echo "ERROR: Deployment did not become AVAILABLE within 35 minutes"
+            exit 1
+          fi
+
+          # Discover the Green instance identifier from SwitchoverDetails
+          GREEN_INSTANCE=$(aws rds describe-blue-green-deployments \
+            --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+            --region "$AWS_REGION" \
+            --query 'BlueGreenDeployments[0].SwitchoverDetails[*].TargetMember' \
+            --output text | tr '\t' '\n' | grep ':db:' | sed 's/.*:db://' | head -1)
+          echo "green_instance=${GREEN_INSTANCE}" >> "$GITHUB_OUTPUT"
+          echo "Green instance: $GREEN_INSTANCE"
+
+      # -----------------------------------------------------------------------
+      - name: Phase 1 — Pre-Switchover Validation
+        run: |
+          bash validate_rds_blue_green.sh \
+            --blue-instance  "${{ steps.resolve.outputs.blue_instance }}"  \
+            --green-instance "${{ steps.create_bg.outputs.green_instance }}" \
+            --deployment-id  "${{ steps.create_bg.outputs.deployment_id }}" \
+            --duplo-host     "$DUPLO_HOST"   \
+            --duplo-token    "$DUPLO_TOKEN"  \
+            --duplo-tenant   "$DUPLO_TENANT" \
+            --region         "$AWS_REGION"   \
+            --db-user        pgadmin         \
+            --db-name        postgres        \
+            --phase          pre
+
+      # -----------------------------------------------------------------------
+      - name: Switchover — Promote Green to Primary
+        id: switchover
+        run: |
+          DEPLOYMENT_ID="${{ steps.create_bg.outputs.deployment_id }}"
+          echo "Initiating switchover for $DEPLOYMENT_ID ..."
+
+          aws rds switchover-blue-green-deployment \
+            --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+            --switchover-timeout 300 \
+            --region "$AWS_REGION"
+
+          # Wait for SWITCHOVER_COMPLETED (up to 5 min, poll every 15s)
+          echo "Waiting for switchover to complete..."
+          for i in $(seq 1 20); do
+            STATUS=$(aws rds describe-blue-green-deployments \
+              --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+              --query 'BlueGreenDeployments[0].Status' \
+              --output text --region "$AWS_REGION" 2>/dev/null || echo "")
+            echo "  [$((i * 15))s] Status: $STATUS"
+            [[ "$STATUS" == "SWITCHOVER_COMPLETED" ]] && break
+            sleep 15
+          done
+
+          if [[ "$STATUS" != "SWITCHOVER_COMPLETED" ]]; then
+            echo "ERROR: Switchover did not complete within 5 minutes (status: $STATUS)"
+            exit 1
+          fi
+          echo "Switchover completed successfully."
+
+      # -----------------------------------------------------------------------
+      - name: Phase 2 + 3 — Post-Switchover Validation + Monitoring
+        run: |
+          bash validate_rds_blue_green.sh \
+            --blue-instance  "${{ steps.resolve.outputs.blue_instance }}"    \
+            --green-instance "${{ steps.create_bg.outputs.green_instance }}"  \
+            --deployment-id  "${{ steps.create_bg.outputs.deployment_id }}"   \
+            --duplo-host     "$DUPLO_HOST"   \
+            --duplo-token    "$DUPLO_TOKEN"  \
+            --duplo-tenant   "$DUPLO_TENANT" \
+            --region         "$AWS_REGION"   \
+            --db-user        pgadmin         \
+            --db-name        postgres        \
+            --monitor-duration "${{ inputs.monitor_duration }}" \
+            --monitor-interval "${{ inputs.monitor_interval }}" \
+            --phase          post+monitor
+
+      # -----------------------------------------------------------------------
+      - name: Phase 4 — Cleanup and Delete RDS
+        if: always()
+        run: |
+          bash validate_rds_blue_green.sh \
+            --blue-instance  "${{ steps.resolve.outputs.blue_instance }}"    \
+            --green-instance "${{ steps.create_bg.outputs.green_instance }}"  \
+            --deployment-id  "${{ steps.create_bg.outputs.deployment_id }}"   \
+            --duplo-host     "$DUPLO_HOST"   \
+            --duplo-token    "$DUPLO_TOKEN"  \
+            --duplo-tenant   "$DUPLO_TENANT" \
+            --region         "$AWS_REGION"   \
+            --db-user        pgadmin         \
+            --db-name        postgres        \
+            --phase          cleanup         \
+            --delete-rds
+
+      # -----------------------------------------------------------------------
+      - name: Upload Validation Reports
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tenant: ${{ inputs.tenant }}
+          name: rds-bluegreen-validation-${{ github.run_number }}
+          path: /tmp/rds_bg_reports/
+          retention-days: 30
