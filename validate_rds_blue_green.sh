@@ -467,7 +467,7 @@ except:
     --region "$AWS_REGION" \
     --db-cluster-parameter-group-name "$pg_name" \
     --db-parameter-group-family "$pg_family" \
-    --description "Aurora PostgreSQL cluster PG for ${DUPLO_TENANT}/${RDS_IDENTIFIER} — logical replication enabled" \
+    --description "Aurora PostgreSQL cluster PG for ${DUPLO_TENANT}/${RDS_IDENTIFIER} - logical replication enabled" \
     --output json 2>&1) || true
 
   if echo "$pg_create_out" | grep -q '"DBClusterParameterGroupArn"'; then
@@ -496,63 +496,66 @@ except:
   fi
 
   # Create via DuploCloud API
-  print_subsection "0.4  Create Aurora PostgreSQL Serverless v2 via duploctl CLI"
+  print_subsection "0.4  Create Aurora PostgreSQL db.t3.medium via DuploCloud API"
   info "  Tenant:         $DUPLO_TENANT ($tenant_id)"
-  info "  Identifier:     duploservices-${DUPLO_TENANT}-${RDS_IDENTIFIER}"
+  info "  Identifier:     duplo${RDS_IDENTIFIER}"
   info "  Engine:         aurora-postgresql $RDS_ENGINE_VERSION  (Engine code: 9)"
-  info "  Instance class: db.serverless (ACU: $RDS_MIN_ACU – $RDS_MAX_ACU)"
-  info "  Parameter group: $pg_name"
+  info "  Instance class: db.t3.medium (DuploCloud ignores ServerlessV2ScalingConfiguration)"
+  info "  Parameter group: $pg_name (applied post-creation via modify-db-cluster)"
   info "  Region:         $AWS_REGION"
 
-  # Write body to temp file for duploctl
+  # Create RDS via DuploCloud REST API directly (duploctl has a name_from_body bug with "Name" field)
+  # Note: DuploCloud ignores DBClusterParameterGroupName and ServerlessV2ScalingConfiguration in the
+  # creation body — we apply the parameter group separately after creation via AWS CLI.
+  # Use db.t3.medium because DuploCloud silently sets ServerlessV2 MinCapacity=0.0 which breaks B/G.
   local rds_body_file="/tmp/rds-create-${RDS_IDENTIFIER}.json"
   cat > "$rds_body_file" <<BODY
 {
   "Name": "${RDS_IDENTIFIER}",
+  "Identifier": "${RDS_IDENTIFIER}",
   "Engine": 9,
   "EngineVersion": "${RDS_ENGINE_VERSION}",
-  "SizeEx": "db.serverless",
+  "SizeEx": "db.t3.medium",
   "MasterUsername": "${RDS_MASTER_USER}",
-  "MasterUserPassword": "${RDS_MASTER_PASSWORD}",
+  "MasterPassword": "${RDS_MASTER_PASSWORD}",
   "StorageEncrypted": true,
   "BackupRetentionPeriod": 7,
-  "MultiAZ": false,
-  "DBClusterParameterGroupName": "${pg_name}",
-  "ServerlessV2ScalingConfiguration": {
-    "MinCapacity": ${RDS_MIN_ACU},
-    "MaxCapacity": ${RDS_MAX_ACU}
-  }
+  "MultiAZ": false
 }
 BODY
 
   local response
-  response=$(duploctl \
-    --host "$DUPLO_HOST" \
-    --token "$DUPLO_BEARER_TOKEN" \
-    --tenant "$DUPLO_TENANT" \
-    rds create --file "$rds_body_file" 2>&1)
+  response=$(curl -s --max-time 30 -X POST \
+    -H "Authorization: Bearer ${DUPLO_BEARER_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data-binary "@${rds_body_file}" \
+    "${DUPLO_HOST}/v3/subscriptions/${tenant_id}/aws/rds/instance" 2>&1)
 
   if echo "$response" | python3 -c "
 import json,sys
 try:
     d=json.load(sys.stdin)
     msg=str(d.get('Message',''))
-    if any(w in msg.lower() for w in ['error','denied','invalid','failed']):
+    if any(w in msg.lower() for w in ['error','denied','invalid','failed','null']):
         print('ERROR:' + msg); exit(1)
-    print('OK')
+    if d.get('Identifier') or d.get('ClusterIdentifier'):
+        print('OK')
+    else:
+        print('ERROR:unexpected response'); exit(1)
 except:
     print('OK')
 " 2>/dev/null | grep -q "^OK"; then
-    record_check "PASS" "RDS creation request accepted by duploctl" ""
+    record_check "PASS" "RDS creation request accepted" ""
     info "  Response: ${response:0:300}"
   else
-    record_check "FAIL" "RDS creation failed via duploctl" "$response"
+    record_check "FAIL" "RDS creation failed" "$response"
     return 1
   fi
 
   # Wait for cluster to become available
+  # DuploCloud names instances as duplo{name}, clusters as duplo{name}-cluster
   print_subsection "0.5  Wait for Cluster to Become Available"
-  local cluster_id="duploservices-${DUPLO_TENANT}-${RDS_IDENTIFIER}"
+  local cluster_id="duplo${RDS_IDENTIFIER}-cluster"
   info "  Polling cluster: $cluster_id (up to 15 min)"
 
   local elapsed=0
@@ -580,8 +583,9 @@ except:
   fi
 
   # Wait for instance
+  # DuploCloud names the instance as duplo{name} (not duplo{name}-cluster-1)
   print_subsection "0.6  Wait for Instance to Become Available"
-  local instance_id="${cluster_id}-1"
+  local instance_id="duplo${RDS_IDENTIFIER}"
   elapsed=0
   while (( elapsed < max_wait )); do
     local inst_status
@@ -601,12 +605,6 @@ except:
         --query 'DBClusters[0].Endpoint' \
         --output text 2>/dev/null || echo "unknown")
       record_check "PASS" "Aurora instance is available" "Instance: $instance_id  Endpoint: $ep"
-      info ""
-      info "  ✓ RDS cluster ready for Blue/Green deployment setup:"
-      info "    Cluster ID  : $cluster_id"
-      info "    Instance ID : $instance_id"
-      info "    Endpoint    : $ep"
-      info "    Port        : 5432"
       break
     fi
     sleep 30
@@ -616,6 +614,92 @@ except:
   if (( elapsed >= max_wait )); then
     record_check "WARN" "Instance did not become available within ${max_wait}s — check AWS console" ""
   fi
+
+  # Apply parameter group to cluster and reboot instance
+  # DuploCloud's API ignores DBClusterParameterGroupName, so we must apply it post-creation.
+  print_subsection "0.7  Apply Parameter Group and Enable Logical Replication"
+  info "  Applying $pg_name to cluster $cluster_id..."
+
+  local modify_out
+  modify_out=$(aws_rds_direct modify-db-cluster \
+    --region "$AWS_REGION" \
+    --db-cluster-identifier "$cluster_id" \
+    --db-cluster-parameter-group-name "$pg_name" \
+    --apply-immediately \
+    --output json 2>&1) || true
+
+  if echo "$modify_out" | grep -q '"DBClusterIdentifier"'; then
+    record_check "PASS" "Cluster parameter group updated to $pg_name" ""
+  else
+    record_check "FAIL" "Failed to apply parameter group to cluster" "$modify_out"
+    return 1
+  fi
+
+  info "  Rebooting instance $instance_id to apply rds.logical_replication=1..."
+  local reboot_out
+  reboot_out=$(aws_rds_direct reboot-db-instance \
+    --region "$AWS_REGION" \
+    --db-instance-identifier "$instance_id" \
+    --output json 2>&1) || true
+
+  if echo "$reboot_out" | grep -q '"DBInstanceIdentifier"'; then
+    record_check "PASS" "Instance reboot initiated" ""
+  else
+    record_check "WARN" "Reboot initiation unclear — checking instance status" "$reboot_out"
+  fi
+
+  info "  Waiting for instance to return to available after reboot (up to 10 min)..."
+  elapsed=0
+  local max_reboot=600
+  while (( elapsed < max_reboot )); do
+    local inst_status
+    inst_status=$(aws_rds_direct describe-db-instances \
+      --region "$AWS_REGION" \
+      --db-instance-identifier "$instance_id" \
+      --query 'DBInstances[0].DBInstanceStatus' \
+      --output text 2>/dev/null || echo "not-found")
+
+    info "  [${elapsed}s] Instance status: $inst_status"
+
+    if [[ "$inst_status" == "available" ]]; then
+      record_check "PASS" "Instance available after reboot" ""
+      break
+    fi
+    sleep 30
+    elapsed=$((elapsed+30))
+  done
+
+  if (( elapsed >= max_reboot )); then
+    record_check "WARN" "Instance did not return to available within ${max_reboot}s after reboot" ""
+  fi
+
+  # Verify logical replication is enabled
+  local lr_val
+  lr_val=$(aws_rds_direct describe-db-cluster-parameters \
+    --region "$AWS_REGION" \
+    --db-cluster-parameter-group-name "$pg_name" \
+    --query "Parameters[?ParameterName=='rds.logical_replication'].ParameterValue | [0]" \
+    --output text 2>/dev/null || echo "unknown")
+
+  if [[ "$lr_val" == "1" ]]; then
+    record_check "PASS" "rds.logical_replication=1 confirmed in parameter group" ""
+  else
+    record_check "WARN" "rds.logical_replication value: $lr_val (expected 1)" ""
+  fi
+
+  local ep
+  ep=$(aws_rds_direct describe-db-clusters \
+    --region "$AWS_REGION" \
+    --db-cluster-identifier "$cluster_id" \
+    --query 'DBClusters[0].Endpoint' \
+    --output text 2>/dev/null || echo "unknown")
+
+  info ""
+  info "  ✓ RDS cluster ready for Blue/Green deployment setup:"
+  info "    Cluster ID  : $cluster_id"
+  info "    Instance ID : $instance_id"
+  info "    Endpoint    : $ep"
+  info "    Port        : 5432"
 }
 
 # ---------------------------------------------------------------------------
