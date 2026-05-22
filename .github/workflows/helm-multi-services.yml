@@ -103,10 +103,44 @@ jobs:
       - name: Build kubeconfig for mj4
         run: |
           pip install duplocloud-client -q
+
+          # duploctl jit k8s returns ExecCredential JSON — write to temp file
           duploctl --host ${{ env.DUPLO_HOST }} \
             --token ${{ secrets.DUPLO_TOKEN }} \
             --tenant ${{ env.DUPLO_TENANT }} \
-            jit k8s > /tmp/kubeconfig.yaml
+            jit k8s > /tmp/cred.json
+
+          # Parse ExecCredential and build static-token kubeconfig
+          python3 - <<PY
+          import json
+          cred   = json.load(open("/tmp/cred.json"))
+          server = cred["spec"]["cluster"]["server"]
+          ca     = cred["spec"]["cluster"]["certificate-authority-data"]
+          token  = cred["status"]["token"]
+          ns     = "${{ env.FLUX_NAMESPACE }}"
+          kubeconfig = f"""apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: {server}
+    certificate-authority-data: {ca}
+  name: mj4-cluster
+contexts:
+- context:
+    cluster: mj4-cluster
+    namespace: {ns}
+    user: mj4-user
+  name: mj4
+current-context: mj4
+users:
+- name: mj4-user
+  user:
+    token: {token}
+"""
+          open("/tmp/kubeconfig.yaml", "w").write(kubeconfig)
+          print("kubeconfig written successfully")
+          PY
+
           echo "KUBECONFIG=/tmp/kubeconfig.yaml" >> $GITHUB_ENV
           kubectl config current-context
 
