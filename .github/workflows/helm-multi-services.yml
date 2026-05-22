@@ -99,65 +99,16 @@ jobs:
           name: helm-chart
           path: /tmp/charts/
 
-      # ── Install duplo-jit and build kubeconfig ────────────────────────────────
+      # ── Build kubeconfig via duploctl ─────────────────────────────────────────
       - name: Build kubeconfig for mj4
         run: |
-          curl -sL https://github.com/duplocloud/duplo-jit/releases/latest/download/duplo-jit-linux-amd64.tar.gz \
-            | tar -xz -C /usr/local/bin/
-          chmod +x /usr/local/bin/duplo-jit
-
-          # Get EKS cluster endpoint from DuploCloud API
-          pip install requests -q
-          CLUSTER_ENDPOINT=$(python3 - <<'PY'
-          import os, requests, sys
-          headers = {"Authorization": f"Bearer {os.environ['DUPLO_TOKEN']}"}
-          r = requests.get(
-            f"{os.environ['DUPLO_HOST']}/v3/admin/plans",
-            headers=headers, timeout=30
-          )
-          for plan in r.json():
-              ep = (plan.get("MetaData") or {}).get("K8sConfig", {}).get("ApiServer", "")
-              if ep:
-                  print(ep)
-                  sys.exit(0)
-          print("", file=sys.stderr); sys.exit(1)
-          PY
-          )
-          echo "Cluster endpoint: $CLUSTER_ENDPOINT"
-
-          cat > /tmp/kubeconfig.yaml <<KUBEEOF
-          apiVersion: v1
-          kind: Config
-          clusters:
-          - cluster:
-              server: ${CLUSTER_ENDPOINT}
-              insecure-skip-tls-verify: true
-            name: mj4-cluster
-          contexts:
-          - context:
-              cluster: mj4-cluster
-              namespace: ${FLUX_NAMESPACE}
-              user: mj4-user
-            name: mj4
-          current-context: mj4
-          users:
-          - name: mj4-user
-            user:
-              exec:
-                apiVersion: client.authentication.k8s.io/v1beta1
-                command: duplo-jit
-                args:
-                - k8s
-                - -host
-                - ${DUPLO_HOST}
-                - -token
-                - ${DUPLO_TOKEN}
-                - -tenant
-                - ${DUPLO_TENANT}
-          KUBEEOF
+          pip install duplocloud-client -q
+          duploctl --host ${{ env.DUPLO_HOST }} \
+            --token ${{ secrets.DUPLO_TOKEN }} \
+            --tenant ${{ env.DUPLO_TENANT }} \
+            jit k8s > /tmp/kubeconfig.yaml
           echo "KUBECONFIG=/tmp/kubeconfig.yaml" >> $GITHUB_ENV
-        env:
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+          kubectl config current-context
 
       # ── Deploy with helm upgrade --install ───────────────────────────────────
       - name: Deploy multi-services
