@@ -75,36 +75,6 @@ if [[ "$DELETE_MODE" == "false" && "$PROTOCOL" == "https" && -z "$CERT_ARN" ]]; 
   die "CERT_ARN is required for HTTPS protocol"
 fi
 
-# ─── Auth: resolve DuploCloud Bearer token ────────────────────────────────────
-
-get_duplo_token() {
-  # Prefer duploctl (Python SDK) for interactive/cached token resolution
-  if command -v duploctl &>/dev/null; then
-    python3 - <<'PYEOF'
-import sys, os
-# Locate duplocloud-client package (pipx or system)
-import subprocess, json
-
-result = subprocess.run(
-  ["duploctl", "--host", os.environ["DUPLO_HOST"],
-   "--interactive", "--admin", "--tenant", os.environ["DUPLO_TENANT"],
-   "--output", "json", "tenant", "find"],
-  capture_output=True, text=True
-)
-# We don't need the tenant output; we just want to trigger auth.
-# Now read the cached token that duploctl wrote.
-import pathlib, json as _json
-cache_host = os.environ["DUPLO_HOST"].replace("https://","").replace("http://","")
-cache_file = pathlib.Path.home() / ".duplo" / "cache" / f"{cache_host},duplo-creds.json"
-if cache_file.exists():
-    data = _json.loads(cache_file.read_text())
-    print(data.get("DuploToken",""))
-PYEOF
-  else
-    die "duploctl not found. Install with: pip install duplocloud-client"
-  fi
-}
-
 # ─── Core API helpers ─────────────────────────────────────────────────────────
 
 DUPLO_TOKEN=""
@@ -117,34 +87,56 @@ init_auth() {
     export AWS_PROFILE
   fi
 
-  # Use Python SDK directly for reliable token + tenant-id resolution
-  eval "$(python3 - <<'PYEOF'
-import sys, os, json
-sys.path.insert(0, '')
-# Try to find duplocloud-client in pipx or system
-import importlib.util, subprocess
+  # Use duploctl to trigger interactive auth, then read the cached token + resolve tenant ID
+  command -v duploctl &>/dev/null || die "duploctl not found. Install with: pipx install duplocloud-client"
 
-def find_site():
-    try:
-        r = subprocess.run(["python3","-c","import duplocloud; print(duplocloud.__file__)"],
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            import pathlib
-            return str(pathlib.Path(r.stdout.strip()).parent.parent)
-    except Exception:
-        pass
-    return None
+  # Trigger auth and cache credentials
+  duploctl --host "$DUPLO_HOST" --interactive --admin \
+    --tenant "$DUPLO_TENANT" tenant list &>/dev/null || true
 
-site = find_site()
-if site:
-    sys.path.insert(0, site)
+  # Read decrypted token and tenant ID from cache via duploctl jit
+  eval "$(python3 - <<PYEOF
+import os, sys, subprocess, json, pathlib
 
-from duplocloud.controller import DuploCtl
-duplo = DuploCtl(host=os.environ["DUPLO_HOST"], interactive=True, isadmin=True,
-                 tenant=os.environ["DUPLO_TENANT"])
-svc = duplo.load("service")
-token = svc.client.token
-tenant_id = svc.tenant_id
+host = os.environ["DUPLO_HOST"]
+tenant = os.environ["DUPLO_TENANT"]
+
+# Read cached encrypted token
+cache_host = host.replace("https://","").replace("http://","")
+cache_file = pathlib.Path.home() / ".duplo" / "cache" / f"{cache_host},duplo-creds.json"
+if not cache_file.exists():
+    print("echo 'ERROR: No cached credentials found. Run duploctl login first.' >&2", flush=True)
+    sys.exit(1)
+
+# Use duploctl to list tenants and extract token + tenant ID
+r = subprocess.run(
+    ["duploctl", "--host", host, "--interactive", "--admin",
+     "--tenant", tenant, "--output", "json", "tenant", "list"],
+    capture_output=True, text=True
+)
+if r.returncode != 0:
+    print(f"echo 'ERROR: duploctl auth failed: {r.stderr[:200]}' >&2", flush=True)
+    sys.exit(1)
+
+tenants = json.loads(r.stdout)
+tenant_id = next((t["TenantId"] for t in tenants if t.get("AccountName","").lower() == tenant.lower()), "")
+if not tenant_id:
+    print(f"echo 'ERROR: Tenant {tenant!r} not found' >&2", flush=True)
+    sys.exit(1)
+
+# Get token via jit
+r2 = subprocess.run(
+    ["duploctl", "--host", host, "--interactive", "--admin",
+     "--tenant", tenant, "--output", "json", "jit", "aws"],
+    capture_output=True, text=True
+)
+# Extract Bearer token from cache (jit call refreshes it)
+cache_data = json.loads(cache_file.read_text())
+token = cache_data.get("DuploToken", "")
+if not token:
+    print("echo 'ERROR: Could not read token from cache' >&2", flush=True)
+    sys.exit(1)
+
 print(f"export DUPLO_TOKEN={token!r}")
 print(f"export TENANT_ID={tenant_id!r}")
 PYEOF
@@ -168,7 +160,7 @@ duplo_post() {
     -d "$body")
 
   http_code=$(echo "$response" | tail -1)
-  body_out=$(echo "$response" | head -n -1)
+  body_out=$(echo "$response" | sed '$d')
 
   if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
     echo "$body_out"
@@ -207,8 +199,8 @@ print(json.dumps(d))
 
 attach_lb() {
   local name="$1"
-  local is_internal="false"
-  [[ "$INTERNAL_LB" == "true" ]] && is_internal="true"
+  local is_internal="False"
+  [[ "$INTERNAL_LB" == "true" ]] && is_internal="True"
 
   local payload
   payload=$(python3 -c "
