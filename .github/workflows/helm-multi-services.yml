@@ -23,10 +23,10 @@ on:
 
 env:
   DUPLO_HOST: https://perf.duplocloud.net
-  DUPLO_TENANT: mj1
-  TENANT_ID: 94d13c08-ae86-46c1-8ade-a33103546cc0
+  DUPLO_TENANT: mj4
+  TENANT_ID: 4c211724-a237-4cc7-ad4f-87edb3da18b7
   CHART_DIR: charts/multi-services
-  FLUX_NAMESPACE: duploservices-mj1
+  FLUX_NAMESPACE: duploservices-mj4
   CERT_ARN: arn:aws:acm:us-east-2:309617244960:certificate/e48470c9-502b-48e4-9e08-acd376b39741
 
 jobs:
@@ -75,7 +75,7 @@ jobs:
                           print(f"https://{dns}")
                           sys.exit(0)
           # fallback: use internal cluster DNS (only works from within cluster)
-          print("http://chartmuseum.duploservices-mj1.svc.cluster.local:8080")
+          print("http://chartmuseum.duploservices-mj4.svc.cluster.local:8080")
           PY
           )
           echo "url=$URL" >> "$GITHUB_OUTPUT"
@@ -154,24 +154,26 @@ jobs:
           duplo_token: ${{ secrets.DUPLO_TOKEN }}
 
       # ── Build kubeconfig from DuploCloud JIT ──────────────────────────────────
-      - name: Build kubeconfig for mj1
+      - name: Build kubeconfig for mj4
         run: |
           # Install duplo-jit
           curl -sL https://github.com/duplocloud/duplo-jit/releases/latest/download/duplo-jit-linux-amd64.tar.gz \
             | tar -xz -C /usr/local/bin/
           chmod +x /usr/local/bin/duplo-jit
 
-          # Generate kubeconfig using duplo-jit
+          # Resolve EKS cluster endpoint from DuploCloud API
           CLUSTER_ENDPOINT=$(python3 - <<'PY'
           import os, requests
           headers = {"Authorization": f"Bearer {os.environ['DUPLO_TOKEN']}"}
-          # Get EKS cluster endpoint from DuploCloud infra
           r = requests.get(
-            f"{os.environ['DUPLO_HOST']}/subscriptions/{os.environ['TENANT_ID']}/GetReplicationControllers",
+            f"{os.environ['DUPLO_HOST']}/v3/admin/plans",
             headers=headers
           )
-          # EKS endpoint is constant; use the known value
-          print("https://07f9b69677f2913be133349bad5335c1.yl4.us-east-2.eks.amazonaws.com")
+          for plan in r.json():
+              ep = plan.get("MetaData", {}).get("K8sConfig", {}).get("ApiServer", "")
+              if ep:
+                  print(ep)
+                  import sys; sys.exit(0)
           PY
           )
 
@@ -181,17 +183,17 @@ jobs:
           clusters:
           - cluster:
               server: ${CLUSTER_ENDPOINT}
-              certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lJTFZMSFU4TUJGalV3RFFZSktvWklodmNOQVFFTEJRQXdGVEVUTUJFR0ExVUUKQXhNS2EzVmlaWEp1WlhSbGN6QWVGdzB5TmpBek1qTXhPREkxTWpkYUZ3MHpOakF6TWpBeE9ETXdNamRhTUJVeApFekFSQmdOVkJBTVRDbXQxWW1WeWJtVjBaWE13Z2dFaU1BMEdDU3FHU0liM0RRRUJBUVVBQTRJQkR3QXdnZ0VLCkFvSUJBUURVclFaN1RoQmZoS0NXbmdYdFIzdkhRK0JMYjVxQVFlbk1GbnBLVlBFQzZISUhBWWNPSEtDQWZJN0sKNzZxUFlRd2JJVy9UNUFRZEJUSFJvaW9KQVU3VUFxMkdPNSsyU3ZLaHNsb1cxYUV1SmU3QUgrOVpZdnpjQ1NsRgpyQTN4N1lqQUlCWTBzdUtNOXErRHhraURHQTRCZURvMlRWWG1lRDZRQjZOYjhnNGpYdlloZzNmUS9PalVPM201CkxITmVuOE13eXFzY3EzTDc5b0hUMEtTTzVaM25qUGFPaTNXQThvOEsyVkUwVjFYSitxcGJNdDV4akFUSURTNjMKWGx4KzF0M2hXbnFPNTdVNGxGQi93QmFPVTRqNW1ITGtPdDN1dkdyV0tkaEZ1TGFBYmZ1TzloNXVxd0xjRHpSdgpEVDJmb3JwSkVWWHFjTmNTdm5KME1OYkE0Y1JsQWdNQkFBR2pXVEJYTUE0R0ExVWREd0VCL3dRRUF3SUNwREFQCkJnTlZIUk1CQWY4RUJUQURBUUgvTUIwR0ExVWREZ1FXQkJSSGowdXJ0dFZDbWdPZ21RTHdaZ214cjc1ZEt6QVYKQmdOVkhSRUVEakFNZ2dwcmRXSmxjbTVsZEdWek1BMEdDU3FHU0liM0RRRUJDd1VBQTRJQkFRQy9aUERpVFlUcgpTU294azgraUlYYllFbFVLWDRJWE1CV09pMm9sY2l3TFEvUmNpY3ZPaTRpeEEramNxeHkxVDRpVTlkMkF1ZlJECjE4bGZsNFFzM2Q2dk1iUGVhcnFuclJSMzJWSkZ6WGwzUDlyUmtkMCtjcEp6L0ozTG1vekR6ZlYzc21MemVkcnoKTi9jWXd5cC9YMERIbGUyMENQKzBYemZoc1pZSVJpV2FBTmpyMG56RXh3MWhLQml4WCsxVS9kaHhLSXc2NitMagpvbTR6K1YwSk9tbHpoamI4em1kVFlpZlNMYzYwT2NJdmRqS3lRSUlUKy8xdmsrZlpKVHRSbzVqcHk5cjVlWXRCCjR2NFM0OVFsaXdmRVJNMGE2TnhwTFUzNEdHVjkrR1I4WVZBSkI3a3BlYkNDemNzcnVob2FoNmtka25GR0FSU2wKRHR4aXYvcEY4MHJ3Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
-            name: mj1-cluster
+              insecure-skip-tls-verify: true
+            name: mj4-cluster
           contexts:
           - context:
-              cluster: mj1-cluster
-              namespace: duploservices-mj1
-              user: mj1-user
-            name: mj1
-          current-context: mj1
+              cluster: mj4-cluster
+              namespace: duploservices-mj4
+              user: mj4-user
+            name: mj4
+          current-context: mj4
           users:
-          - name: mj1-user
+          - name: mj4-user
             user:
               exec:
                 apiVersion: client.authentication.k8s.io/v1beta1
@@ -203,7 +205,7 @@ jobs:
                 - -token
                 - ${DUPLO_TOKEN_ENCRYPTED}
                 - -tenant
-                - mj1
+                - mj4
           KUBEEOF
           echo "KUBECONFIG=/tmp/kubeconfig.yaml" >> $GITHUB_ENV
         env:
