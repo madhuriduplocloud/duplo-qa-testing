@@ -56,13 +56,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-client jq netcat-openbsd
+          pip3 install duplocloud-client==0.4.3
           chmod +x validate_rds_blue_green.sh
 
       # -----------------------------------------------------------------------
-      - name: Setup AWS via DuploCloud
-        uses: duplocloud/actions@node24-upgrade
-        with:
-          region: ${{ inputs.region }}
+      - name: Setup AWS via DuploCloud JIT
+        run: |
+          CREDS=$(duploctl jit aws --admin --output json)
+          echo "AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.AccessKeyId')"     >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.SecretAccessKey')" >> "$GITHUB_ENV"
+          echo "AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.SessionToken')"    >> "$GITHUB_ENV"
+          echo "AWS_DEFAULT_REGION=$AWS_REGION"                                 >> "$GITHUB_ENV"
+          echo "AWS creds obtained — Account=$(echo "$CREDS" | jq -r '.AccessKeyId'[0:12])"
+        env:
+          DUPLO_HOST:  ${{ vars.DUPLO_HOST }}
+          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
 
       # -----------------------------------------------------------------------
       - name: Phase 0 — Create RDS Instance
