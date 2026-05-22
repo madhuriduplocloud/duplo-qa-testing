@@ -1,0 +1,261 @@
+name: Helm Multi-Services – Package, Push & Deploy
+
+on:
+  push:
+    branches: [testing]
+    paths:
+      - "charts/multi-services/**"
+      - ".github/workflows/helm-multi-services.yml"
+  workflow_dispatch:
+    inputs:
+      service_count:
+        description: "Number of services to create (default: 25)"
+        required: false
+        default: "25"
+      name_prefix:
+        description: "Service name prefix (default: serv)"
+        required: false
+        default: "serv"
+      chart_version:
+        description: "Chart version override (leave blank to auto-bump)"
+        required: false
+        default: ""
+
+env:
+  DUPLO_HOST: https://perf.duplocloud.net
+  DUPLO_TENANT: mj1
+  TENANT_ID: 94d13c08-ae86-46c1-8ade-a33103546cc0
+  CHART_DIR: charts/multi-services
+  FLUX_NAMESPACE: duploservices-mj1
+  CERT_ARN: arn:aws:acm:us-east-2:309617244960:certificate/e48470c9-502b-48e4-9e08-acd376b39741
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Package chart and push to ChartMuseum
+  # ─────────────────────────────────────────────────────────────────────────────
+  package-and-push:
+    name: Package & Push to ChartMuseum
+    runs-on: ubuntu-latest
+    outputs:
+      chart_version: ${{ steps.version.outputs.version }}
+      chartmuseum_url: ${{ steps.cm_url.outputs.url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      # ── Authenticate with DuploCloud to get AWS + Duplo credentials ──────────
+      - name: Configure AWS credentials via DuploCloud JIT
+        uses: duplocloud/actions/setup-aws@main
+        with:
+          duplo_host: ${{ env.DUPLO_HOST }}
+          duplo_token: ${{ secrets.DUPLO_TOKEN }}
+
+      # ── Resolve ChartMuseum external URL from DuploCloud API ─────────────────
+      - name: Get ChartMuseum URL
+        id: cm_url
+        run: |
+          pip install requests -q
+          URL=$(python3 - <<'PY'
+          import os, requests, sys
+          headers = {"Authorization": f"Bearer {os.environ['DUPLO_TOKEN']}"}
+          r = requests.get(
+            f"{os.environ['DUPLO_HOST']}/subscriptions/{os.environ['TENANT_ID']}/GetReplicationControllers",
+            headers=headers, timeout=30
+          )
+          for svc in r.json():
+              if svc.get("Name") == "chartmuseum":
+                  lbc = svc.get("Template", {}).get("LBConfigurations", {})
+                  for v in lbc.values():
+                      dns = v.get("DnsName", "")
+                      if dns:
+                          print(f"https://{dns}")
+                          sys.exit(0)
+          # fallback: use internal cluster DNS (only works from within cluster)
+          print("http://chartmuseum.duploservices-mj1.svc.cluster.local:8080")
+          PY
+          )
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "ChartMuseum URL: $URL"
+        env:
+          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+
+      # ── Optionally bump version ───────────────────────────────────────────────
+      - name: Resolve chart version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.chart_version }}" ]; then
+            VERSION="${{ github.event.inputs.chart_version }}"
+          else
+            # Auto-increment patch from current Chart.yaml
+            CURRENT=$(grep '^version:' $CHART_DIR/Chart.yaml | awk '{print $2}')
+            MAJOR=$(echo $CURRENT | cut -d. -f1)
+            MINOR=$(echo $CURRENT | cut -d. -f2)
+            PATCH=$(echo $CURRENT | cut -d. -f3)
+            VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            # Update Chart.yaml in-place for packaging
+            sed -i "s/^version:.*/version: $VERSION/" $CHART_DIR/Chart.yaml
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Chart version: $VERSION"
+
+      # ── Package the chart ─────────────────────────────────────────────────────
+      - name: Package Helm chart
+        run: |
+          helm package $CHART_DIR --version ${{ steps.version.outputs.version }} \
+            --destination /tmp/charts/
+          ls -la /tmp/charts/
+
+      # ── Push to ChartMuseum ───────────────────────────────────────────────────
+      - name: Push chart to ChartMuseum
+        run: |
+          CHART_FILE=$(ls /tmp/charts/multi-services-*.tgz)
+          CM_URL="${{ steps.cm_url.outputs.url }}"
+          echo "Pushing $CHART_FILE to $CM_URL"
+          curl -sf --retry 3 --retry-delay 5 \
+            -F "chart=@${CHART_FILE}" \
+            "${CM_URL}/api/charts"
+          echo "Chart pushed successfully"
+
+      # ── Verify chart is available in ChartMuseum ──────────────────────────────
+      - name: Verify chart in ChartMuseum
+        run: |
+          CM_URL="${{ steps.cm_url.outputs.url }}"
+          curl -sf "${CM_URL}/api/charts/multi-services" | python3 -c \
+            "import sys,json; charts=json.load(sys.stdin); \
+             print(f'Available versions: {[c[\"version\"] for c in charts]}')"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: Deploy via FluxCD HelmRelease  (or direct helm install)
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy via FluxCD
+    needs: package-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      # ── Authenticate ──────────────────────────────────────────────────────────
+      - name: Configure AWS credentials via DuploCloud JIT
+        uses: duplocloud/actions/setup-aws@main
+        with:
+          duplo_host: ${{ env.DUPLO_HOST }}
+          duplo_token: ${{ secrets.DUPLO_TOKEN }}
+
+      # ── Build kubeconfig from DuploCloud JIT ──────────────────────────────────
+      - name: Build kubeconfig for mj1
+        run: |
+          # Install duplo-jit
+          curl -sL https://github.com/duplocloud/duplo-jit/releases/latest/download/duplo-jit-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin/
+          chmod +x /usr/local/bin/duplo-jit
+
+          # Generate kubeconfig using duplo-jit
+          CLUSTER_ENDPOINT=$(python3 - <<'PY'
+          import os, requests
+          headers = {"Authorization": f"Bearer {os.environ['DUPLO_TOKEN']}"}
+          # Get EKS cluster endpoint from DuploCloud infra
+          r = requests.get(
+            f"{os.environ['DUPLO_HOST']}/subscriptions/{os.environ['TENANT_ID']}/GetReplicationControllers",
+            headers=headers
+          )
+          # EKS endpoint is constant; use the known value
+          print("https://07f9b69677f2913be133349bad5335c1.yl4.us-east-2.eks.amazonaws.com")
+          PY
+          )
+
+          cat > /tmp/kubeconfig.yaml <<KUBEEOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              server: ${CLUSTER_ENDPOINT}
+              certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lJTFZMSFU4TUJGalV3RFFZSktvWklodmNOQVFFTEJRQXdGVEVUTUJFR0ExVUUKQXhNS2EzVmlaWEp1WlhSbGN6QWVGdzB5TmpBek1qTXhPREkxTWpkYUZ3MHpOakF6TWpBeE9ETXdNamRhTUJVeApFekFSQmdOVkJBTVRDbXQxWW1WeWJtVjBaWE13Z2dFaU1BMEdDU3FHU0liM0RRRUJBUVVBQTRJQkR3QXdnZ0VLCkFvSUJBUURVclFaN1RoQmZoS0NXbmdYdFIzdkhRK0JMYjVxQVFlbk1GbnBLVlBFQzZISUhBWWNPSEtDQWZJN0sKNzZxUFlRd2JJVy9UNUFRZEJUSFJvaW9KQVU3VUFxMkdPNSsyU3ZLaHNsb1cxYUV1SmU3QUgrOVpZdnpjQ1NsRgpyQTN4N1lqQUlCWTBzdUtNOXErRHhraURHQTRCZURvMlRWWG1lRDZRQjZOYjhnNGpYdlloZzNmUS9PalVPM201CkxITmVuOE13eXFzY3EzTDc5b0hUMEtTTzVaM25qUGFPaTNXQThvOEsyVkUwVjFYSitxcGJNdDV4akFUSURTNjMKWGx4KzF0M2hXbnFPNTdVNGxGQi93QmFPVTRqNW1ITGtPdDN1dkdyV0tkaEZ1TGFBYmZ1TzloNXVxd0xjRHpSdgpEVDJmb3JwSkVWWHFjTmNTdm5KME1OYkE0Y1JsQWdNQkFBR2pXVEJYTUE0R0ExVWREd0VCL3dRRUF3SUNwREFQCkJnTlZIUk1CQWY4RUJUQURBUUgvTUIwR0ExVWREZ1FXQkJSSGowdXJ0dFZDbWdPZ21RTHdaZ214cjc1ZEt6QVYKQmdOVkhSRUVEakFNZ2dwcmRXSmxjbTVsZEdWek1BMEdDU3FHU0liM0RRRUJDd1VBQTRJQkFRQy9aUERpVFlUcgpTU294azgraUlYYllFbFVLWDRJWE1CV09pMm9sY2l3TFEvUmNpY3ZPaTRpeEEramNxeHkxVDRpVTlkMkF1ZlJECjE4bGZsNFFzM2Q2dk1iUGVhcnFuclJSMzJWSkZ6WGwzUDlyUmtkMCtjcEp6L0ozTG1vekR6ZlYzc21MemVkcnoKTi9jWXd5cC9YMERIbGUyMENQKzBYemZoc1pZSVJpV2FBTmpyMG56RXh3MWhLQml4WCsxVS9kaHhLSXc2NitMagpvbTR6K1YwSk9tbHpoamI4em1kVFlpZlNMYzYwT2NJdmRqS3lRSUlUKy8xdmsrZlpKVHRSbzVqcHk5cjVlWXRCCjR2NFM0OVFsaXdmRVJNMGE2TnhwTFUzNEdHVjkrR1I4WVZBSkI3a3BlYkNDemNzcnVob2FoNmtka25GR0FSU2wKRHR4aXYvcEY4MHJ3Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+            name: mj1-cluster
+          contexts:
+          - context:
+              cluster: mj1-cluster
+              namespace: duploservices-mj1
+              user: mj1-user
+            name: mj1
+          current-context: mj1
+          users:
+          - name: mj1-user
+            user:
+              exec:
+                apiVersion: client.authentication.k8s.io/v1beta1
+                command: duplo-jit
+                args:
+                - k8s
+                - -host
+                - ${DUPLO_HOST}
+                - -token
+                - ${DUPLO_TOKEN_ENCRYPTED}
+                - -tenant
+                - mj1
+          KUBEEOF
+          echo "KUBECONFIG=/tmp/kubeconfig.yaml" >> $GITHUB_ENV
+        env:
+          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+          DUPLO_TOKEN_ENCRYPTED: ${{ secrets.DUPLO_TOKEN_ENCRYPTED }}
+
+      # ── Ensure duplo-token Secret exists in namespace ────────────────────────
+      - name: Create duplo-token Secret
+        run: |
+          kubectl create secret generic duplo-token \
+            --from-literal=token=${{ secrets.DUPLO_TOKEN }} \
+            --namespace ${{ env.FLUX_NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # ── Apply FluxCD HelmRepository manifest ─────────────────────────────────
+      - name: Register ChartMuseum as HelmRepository
+        run: |
+          kubectl apply -f k8s/flux/helmrepository-chartmuseum.yaml
+          kubectl wait helmrepository/chartmuseum \
+            -n ${{ env.FLUX_NAMESPACE }} \
+            --for=condition=Ready \
+            --timeout=120s
+
+      # ── Patch HelmRelease with requested service count and deploy ─────────────
+      - name: Deploy multi-services HelmRelease
+        run: |
+          SERVICE_COUNT="${{ github.event.inputs.service_count || '25' }}"
+          NAME_PREFIX="${{ github.event.inputs.name_prefix || 'serv' }}"
+          VERSION="${{ needs.package-and-push.outputs.chart_version }}"
+
+          # Patch the HelmRelease manifest with runtime values
+          sed \
+            -e "s/serviceCount: .*/serviceCount: ${SERVICE_COUNT}/" \
+            -e "s/namePrefix: .*/namePrefix: ${NAME_PREFIX}/" \
+            -e "s/version: \".*\"/version: \"${VERSION}\"/" \
+            k8s/flux/helmrelease-multi-services.yaml \
+            | kubectl apply -f -
+
+          echo "HelmRelease applied. Waiting for reconciliation..."
+          kubectl wait helmrelease/multi-services \
+            -n ${{ env.FLUX_NAMESPACE }} \
+            --for=condition=Ready \
+            --timeout=300s || true
+
+      # ── Print final status ────────────────────────────────────────────────────
+      - name: Deployment summary
+        run: |
+          echo "=== HelmRelease status ==="
+          kubectl get helmrelease multi-services -n ${{ env.FLUX_NAMESPACE }} -o wide
+          echo ""
+          echo "=== Deployments created ==="
+          kubectl get deployments -n ${{ env.FLUX_NAMESPACE }} -l release=multi-services
+          echo ""
+          echo "=== LB attachment job ==="
+          kubectl get jobs -n ${{ env.FLUX_NAMESPACE }} | grep attach-lb || true

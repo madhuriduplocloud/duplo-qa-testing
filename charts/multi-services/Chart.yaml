@@ -1,0 +1,12 @@
+apiVersion: v2
+name: multi-services
+description: Deploys N identically-structured nginx services with optional DuploCloud ALB+ACM LB attachment
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - duplocloud
+  - multi-service
+  - nginx
+maintainers:
+  - name: QA Team

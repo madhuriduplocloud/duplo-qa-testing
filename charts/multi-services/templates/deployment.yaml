@@ -1,0 +1,49 @@
+{{- $root := . -}}
+{{- range $i := until (int .Values.serviceCount) }}
+{{- $idx   := add $i 1 }}
+{{- $name  := printf "%s%d" $root.Values.namePrefix $idx }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    app: {{ $name }}
+    chart: {{ $root.Chart.Name }}-{{ $root.Chart.Version }}
+    release: {{ $root.Release.Name }}
+    {{- with $root.Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  replicas: {{ $root.Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+        release: {{ $root.Release.Name }}
+    spec:
+      containers:
+        - name: {{ $name }}
+          image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag }}"
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ $root.Values.containerPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: {{ $root.Values.healthCheckPath }}
+              port: {{ $root.Values.containerPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: {{ $root.Values.healthCheckPath }}
+              port: {{ $root.Values.containerPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml $root.Values.resources | nindent 12 }}
+{{- end }}

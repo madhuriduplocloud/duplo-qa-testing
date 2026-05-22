@@ -1,0 +1,58 @@
+{{- if .Values.duploLB.enabled }}
+---
+# Secret holding the DuploCloud API token – create this once in the namespace:
+#   kubectl create secret generic duplo-token \
+#     --from-literal=token=<DUPLO_TOKEN> -n duploservices-mj1
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-attach-lb
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: attach-lb
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install requests -q && python3 /scripts/attach_lb.py
+          env:
+            - name: DUPLO_HOST
+              value: {{ .Values.duploLB.host | quote }}
+            - name: TENANT_ID
+              value: {{ .Values.duploLB.tenantId | quote }}
+            - name: CERT_ARN
+              value: {{ .Values.duploLB.certArn | quote }}
+            - name: EXTERNAL_PORT
+              value: {{ .Values.duploLB.externalPort | quote }}
+            - name: PROTOCOL
+              value: {{ .Values.duploLB.protocol | quote }}
+            - name: NAME_PREFIX
+              value: {{ .Values.namePrefix | quote }}
+            - name: SERVICE_COUNT
+              value: {{ .Values.serviceCount | quote }}
+            - name: CONTAINER_PORT
+              value: {{ .Values.containerPort | quote }}
+            - name: DUPLO_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.duploLB.tokenSecretName }}
+                  key: {{ .Values.duploLB.tokenSecretKey }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ .Release.Name }}-lb-script
+{{- end }}

@@ -1,0 +1,17 @@
+---
+# Registers ChartMuseum as a Helm repository source in FluxCD.
+# Apply once:  kubectl apply -f k8s/flux/helmrepository-chartmuseum.yaml -n duploservices-mj1
+#
+# DuploCloud UI will pick this up under Kubernetes → Helm → Repository.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: chartmuseum
+  namespace: duploservices-mj1
+  labels:
+    app.kubernetes.io/managed-by: flux
+spec:
+  # HTTP listener on ChartMuseum ALB (ACM cert is for *.perf-apps.duplocloud.net, not raw ALB DNS)
+  url: http://duplo2-mj1-21-998497511.us-east-2.elb.amazonaws.com
+  interval: 5m
+  timeout: 60s

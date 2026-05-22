@@ -1,0 +1,15 @@
+multi-services chart deployed!
+
+  Release : {{ .Release.Name }}
+  Services: {{ .Values.serviceCount }} ({{ .Values.namePrefix }}1 – {{ .Values.namePrefix }}{{ .Values.serviceCount }})
+  Image   : {{ .Values.image.repository }}:{{ .Values.image.tag }}
+
+{{- if .Values.duploLB.enabled }}
+
+DuploCloud ALB attachment job is running in the background.
+Check status:
+  kubectl get jobs -n {{ .Release.Namespace }} -l release={{ .Release.Name }}
+  kubectl logs -n {{ .Release.Namespace }} job/{{ .Release.Name }}-attach-lb
+
+ALBs typically become active in AWS within 2-3 minutes.
+{{- end }}

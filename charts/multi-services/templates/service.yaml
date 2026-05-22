@@ -1,0 +1,22 @@
+{{- $root := . -}}
+{{- range $i := until (int .Values.serviceCount) }}
+{{- $idx  := add $i 1 }}
+{{- $name := printf "%s%d" $root.Values.namePrefix $idx }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    app: {{ $name }}
+    chart: {{ $root.Chart.Name }}-{{ $root.Chart.Version }}
+    release: {{ $root.Release.Name }}
+spec:
+  type: {{ $root.Values.service.type }}
+  selector:
+    app: {{ $name }}
+  ports:
+    - port: {{ $root.Values.service.port }}
+      targetPort: {{ $root.Values.containerPort }}
+      protocol: TCP
+{{- end }}

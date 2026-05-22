@@ -1,0 +1,50 @@
+# Number of services to create (set to 25 by default – more than 20)
+replicaCount: 1
+serviceCount: 25
+
+# Naming: services will be named <namePrefix>1 … <namePrefix>N
+namePrefix: "serv"
+
+image:
+  repository: nginx
+  tag: alpine
+  pullPolicy: IfNotPresent
+
+# Container port nginx listens on
+containerPort: 80
+
+# Kubernetes Service type for each service
+# ClusterIP – internal only (DuploCloud will manage the external ALB separately)
+service:
+  type: ClusterIP
+  port: 80
+
+# Resource requests/limits per pod
+resources:
+  requests:
+    cpu: "50m"
+    memory: "64Mi"
+  limits:
+    cpu: "200m"
+    memory: "128Mi"
+
+# Health-check probe path
+healthCheckPath: /
+
+# Optional: DuploCloud LB provisioning via init-job
+# Set duploLB.enabled=true to automatically call the DuploCloud API and attach
+# an ALB with a certificate to every service after deployment.
+duploLB:
+  enabled: true
+  host: "https://perf.duplocloud.net"
+  tenant: "mj1"
+  tenantId: "94d13c08-ae86-46c1-8ade-a33103546cc0"
+  certArn: "arn:aws:acm:us-east-2:309617244960:certificate/e48470c9-502b-48e4-9e08-acd376b39741"
+  externalPort: 443
+  protocol: https
+  # Token injected from secret – see duplo-token Secret below
+  tokenSecretName: "duplo-token"
+  tokenSecretKey: "token"
+
+# Extra labels applied to all resources
+commonLabels: {}

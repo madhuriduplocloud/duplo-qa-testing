@@ -1,0 +1,42 @@
+---
+# Deploys the multi-services chart from ChartMuseum via FluxCD.
+# Apply once:  kubectl apply -f k8s/flux/helmrelease-multi-services.yaml -n duploservices-mj1
+#
+# To upgrade: push a new chart version to ChartMuseum – FluxCD reconciles automatically.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: multi-services
+  namespace: duploservices-mj1
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: multi-services
+      version: ">=0.1.0"
+      sourceRef:
+        kind: HelmRepository
+        name: chartmuseum
+        namespace: duploservices-mj1
+  values:
+    serviceCount: 25       # creates serv1 – serv25
+    namePrefix: serv
+    image:
+      repository: nginx
+      tag: alpine
+    duploLB:
+      enabled: true
+      host: "https://perf.duplocloud.net"
+      tenant: "mj1"
+      tenantId: "94d13c08-ae86-46c1-8ade-a33103546cc0"
+      certArn: "arn:aws:acm:us-east-2:309617244960:certificate/e48470c9-502b-48e4-9e08-acd376b39741"
+      externalPort: 443
+      protocol: https
+      tokenSecretName: "duplo-token"
+      tokenSecretKey: "token"
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
