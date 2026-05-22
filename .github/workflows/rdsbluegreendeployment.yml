@@ -56,13 +56,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-client jq netcat-openbsd
-          # Install duploctl binary from GitHub releases
-          DUPLOCTL_VER="0.4.3"
-          mkdir -p /tmp/duploctl-install
-          curl -sL "https://github.com/duplocloud/duploctl/releases/download/v${DUPLOCTL_VER}/duploctl-${DUPLOCTL_VER}-linux-amd64.tar.gz" \
-            | tar xz --no-same-permissions --no-same-owner -C /tmp/duploctl-install
-          sudo install -m 755 /tmp/duploctl-install/duploctl /usr/local/bin/duploctl
-          duploctl --version
           chmod +x validate_rds_blue_green.sh
 
       # -----------------------------------------------------------------------
