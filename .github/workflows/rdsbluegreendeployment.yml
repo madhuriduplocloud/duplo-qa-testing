@@ -62,12 +62,23 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Setup AWS via DuploCloud JIT
         run: |
-          CREDS=$(duploctl jit aws --admin --output json)
-          echo "AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.AccessKeyId')"     >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.SecretAccessKey')" >> "$GITHUB_ENV"
-          echo "AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.SessionToken')"    >> "$GITHUB_ENV"
-          echo "AWS_DEFAULT_REGION=$AWS_REGION"                                 >> "$GITHUB_ENV"
-          echo "AWS creds obtained — Account=$(echo "$CREDS" | jq -r '.AccessKeyId'[0:12])"
+          python3 - <<'PY'
+          import os, sys, json, urllib.request
+          host  = os.environ["DUPLO_HOST"].rstrip("/")
+          token = os.environ["DUPLO_TOKEN"]
+          region = os.environ.get("AWS_REGION", "us-east-2")
+          url = f"{host}/adminproxy/GetJITAwsConsoleAccessUrl"
+          req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              creds = json.loads(r.read())
+          env_file = os.environ["GITHUB_ENV"]
+          with open(env_file, "a") as f:
+              f.write(f"AWS_ACCESS_KEY_ID={creds['AccessKeyId']}\n")
+              f.write(f"AWS_SECRET_ACCESS_KEY={creds['SecretAccessKey']}\n")
+              f.write(f"AWS_SESSION_TOKEN={creds['SessionToken']}\n")
+              f.write(f"AWS_DEFAULT_REGION={region}\n")
+          print(f"AWS creds obtained — KeyId={creds['AccessKeyId'][:12]}... expires={creds.get('Expiration','?')}")
+          PY
         env:
           DUPLO_HOST:  ${{ vars.DUPLO_HOST }}
           DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
