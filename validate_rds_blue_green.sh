@@ -468,7 +468,7 @@ except:
     --db-cluster-parameter-group-name "$pg_name" \
     --db-parameter-group-family "$pg_family" \
     --description "Aurora PostgreSQL cluster PG for ${DUPLO_TENANT}/${RDS_IDENTIFIER} — logical replication enabled" \
-    --output json 2>&1)
+    --output json 2>&1) || true
 
   if echo "$pg_create_out" | grep -q '"DBClusterParameterGroupArn"'; then
     record_check "PASS" "Cluster parameter group created: $pg_name" ""
@@ -486,7 +486,7 @@ except:
     --db-cluster-parameter-group-name "$pg_name" \
     --parameters \
       "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" \
-    --output json 2>&1)
+    --output json 2>&1) || true
 
   if echo "$pg_mod_out" | grep -q "DBClusterParameterGroupName"; then
     record_check "PASS" "rds.logical_replication=1 set in parameter group" ""
