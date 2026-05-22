@@ -70,6 +70,7 @@ jobs:
         uses: duplocloud/actions@node24-upgrade
         with:
           region: ${{ inputs.region }}
+          admin: "true"
 
       # -----------------------------------------------------------------------
       - name: Phase 0 — Create RDS Instance
