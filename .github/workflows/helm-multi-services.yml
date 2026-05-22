@@ -16,6 +16,10 @@ on:
         description: "Service name prefix (default: readonly)"
         required: false
         default: "readonly"
+      image:
+        description: "Container image (e.g. nginx:alpine, nginx:1.25, httpd:alpine)"
+        required: false
+        default: "nginx:alpine"
       chart_version:
         description: "Chart version override (leave blank to auto-bump)"
         required: false
@@ -133,12 +137,17 @@ jobs:
         run: |
           SERVICE_COUNT="${{ github.event.inputs.service_count || '20' }}"
           NAME_PREFIX="${{ github.event.inputs.name_prefix || 'readonly' }}"
+          IMAGE_INPUT="${{ github.event.inputs.image || 'nginx:alpine' }}"
+          IMAGE_REPO="${IMAGE_INPUT%%:*}"
+          IMAGE_TAG="${IMAGE_INPUT##*:}"
           CHART_FILE=$(ls /tmp/charts/multi-services-*.tgz)
 
           helm upgrade --install multi-services "$CHART_FILE" \
             --namespace ${{ env.FLUX_NAMESPACE }} \
             --set serviceCount=${SERVICE_COUNT} \
             --set namePrefix=${NAME_PREFIX} \
+            --set image.repository=${IMAGE_REPO} \
+            --set image.tag=${IMAGE_TAG} \
             --set duploLB.enabled=false \
             --wait --timeout=180s
 
