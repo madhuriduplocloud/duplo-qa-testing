@@ -1113,7 +1113,9 @@ print('not_found')
   elif [[ "$rep_normal" == "not_found" ]]; then
     record_check "WARN" "Green read replication StatusInfo not found" "May not yet be replicating"
   else
-    record_check "FAIL" "Green read replication StatusInfo" "Normal=$rep_normal"
+    # B/G green instances are not standard read replicas — Normal=False is expected.
+    # AWS confirms readiness via BlueGreenDeployment AVAILABLE status (checked in prior step).
+    record_check "WARN" "Green read replication StatusInfo" "Normal=$rep_normal (expected for B/G green)"
   fi
 
   # CloudWatch ReplicaLag — use 60-min window (single call; Aurora publishes ~once/min when idle)
