@@ -87,7 +87,7 @@ jobs:
       - name: Resolve Blue instance and confirm available
         id: resolve
         run: |
-          BLUE_INSTANCE="duplo${RDS_NAME}"
+          BLUE_INSTANCE="${RDS_NAME}"
           echo "blue_instance=${BLUE_INSTANCE}" >> "$GITHUB_OUTPUT"
           echo "Blue instance: ${BLUE_INSTANCE}"
 

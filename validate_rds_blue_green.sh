@@ -433,16 +433,16 @@ except:
 
   # Check if RDS already exists
   print_subsection "0.2  Check for Existing RDS"
+  # Use non-duplo-prefixed names so DuploCloud GC doesn't delete the green cluster.
+  # GC only targets resources with 'duplo' prefix not in DuploCloud state.
+  local cluster_id="${RDS_IDENTIFIER}-cluster"
+  local instance_id="${RDS_IDENTIFIER}"
   local cluster_already_exists=false
   local existing
   existing=$(aws_rds_direct describe-db-clusters \
     --region "$AWS_REGION" \
-    --query "DBClusters[?contains(DBClusterIdentifier,\`${RDS_IDENTIFIER}\`)].{ID:DBClusterIdentifier,Status:Status}" \
+    --query "DBClusters[?DBClusterIdentifier==\`${cluster_id}\`].{ID:DBClusterIdentifier,Status:Status}" \
     --output json 2>/dev/null || echo "[]")
-
-  # DuploCloud names: instance=duplo{name}, cluster=duplo{name}-cluster
-  local cluster_id="duplo${RDS_IDENTIFIER}-cluster"
-  local instance_id="duplo${RDS_IDENTIFIER}"
 
   if echo "$existing" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0) if d else exit(1)" 2>/dev/null; then
     local existing_id
@@ -503,60 +503,79 @@ except:
 
   if [[ "$cluster_already_exists" == "false" ]]; then
 
-  # Create via DuploCloud API
-  print_subsection "0.4  Create Aurora PostgreSQL db.t3.medium via DuploCloud API"
-  info "  Tenant:         $DUPLO_TENANT ($tenant_id)"
-  info "  Identifier:     duplo${RDS_IDENTIFIER}"
-  info "  Engine:         aurora-postgresql $RDS_ENGINE_VERSION  (Engine code: 9)"
-  info "  Instance class: db.t3.medium (DuploCloud ignores ServerlessV2ScalingConfiguration)"
-  info "  Parameter group: $pg_name (applied post-creation via modify-db-cluster)"
+  # Create Aurora cluster+instance directly via AWS CLI with a non-duplo-prefixed name.
+  # IMPORTANT: Using non-duplo prefix prevents DuploCloud GC from deleting the green cluster
+  # created by the B/G deployment (GC only targets duplo-prefixed resources not in its state).
+  print_subsection "0.4  Create Aurora PostgreSQL db.t3.medium via AWS CLI (non-duplo name)"
+  info "  Cluster:        $cluster_id"
+  info "  Instance:       $instance_id"
+  info "  Engine:         aurora-postgresql $RDS_ENGINE_VERSION"
+  info "  Instance class: db.t3.medium"
+  info "  Parameter group: $pg_name"
   info "  Region:         $AWS_REGION"
 
-  # Create RDS via DuploCloud REST API directly (duploctl has a name_from_body bug with "Name" field)
-  # Note: DuploCloud ignores DBClusterParameterGroupName and ServerlessV2ScalingConfiguration in the
-  # creation body — we apply the parameter group separately after creation via AWS CLI.
-  # Use db.t3.medium because DuploCloud silently sets ServerlessV2 MinCapacity=0.0 which breaks B/G.
-  local rds_body_file="/tmp/rds-create-${RDS_IDENTIFIER}.json"
-  cat > "$rds_body_file" <<BODY
-{
-  "Name": "${RDS_IDENTIFIER}",
-  "Identifier": "${RDS_IDENTIFIER}",
-  "Engine": 9,
-  "EngineVersion": "${RDS_ENGINE_VERSION}",
-  "SizeEx": "db.t3.medium",
-  "MasterUsername": "${RDS_MASTER_USER}",
-  "MasterPassword": "${RDS_MASTER_PASSWORD}",
-  "StorageEncrypted": true,
-  "BackupRetentionPeriod": 7,
-  "MultiAZ": false
-}
-BODY
+  # Look up the tenant's RDS subnet group from an existing DuploCloud-managed cluster
+  local subnet_group sg_id
+  subnet_group=$(aws_rds_direct describe-db-clusters \
+    --region "$AWS_REGION" \
+    --query "DBClusters[?starts_with(DBClusterIdentifier,\`duplo\`)].DBSubnetGroup | [0]" \
+    --output text 2>/dev/null || echo "")
 
-  local response
-  response=$(curl -s --max-time 30 -X POST \
-    -H "Authorization: Bearer ${DUPLO_BEARER_TOKEN}" \
-    -H "Content-Type: application/json" \
-    --data-binary "@${rds_body_file}" \
-    "${DUPLO_HOST}/v3/subscriptions/${tenant_id}/aws/rds/instance" 2>&1)
+  if [[ -z "$subnet_group" || "$subnet_group" == "None" ]]; then
+    record_check "FAIL" "Could not determine RDS subnet group from DuploCloud-managed clusters" ""
+    return 1
+  fi
 
-  if echo "$response" | python3 -c "
-import json,sys
-try:
-    d=json.load(sys.stdin)
-    msg=str(d.get('Message',''))
-    if any(w in msg.lower() for w in ['error','denied','invalid','failed','null']):
-        print('ERROR:' + msg); exit(1)
-    if d.get('Identifier') or d.get('ClusterIdentifier'):
-        print('OK')
-    else:
-        print('ERROR:unexpected response'); exit(1)
-except:
-    print('OK')
-" 2>/dev/null | grep -q "^OK"; then
-    record_check "PASS" "RDS creation request accepted" ""
-    info "  Response: ${response:0:300}"
+  sg_id=$(aws --region "$AWS_REGION" ec2 describe-security-groups \
+    --filters "Name=group-name,Values=duploservices-${DUPLO_TENANT}" \
+    --query 'SecurityGroups[0].GroupId' \
+    --output text 2>/dev/null || echo "")
+
+  if [[ -z "$sg_id" || "$sg_id" == "None" ]]; then
+    record_check "FAIL" "Could not find security group for tenant $DUPLO_TENANT" ""
+    return 1
+  fi
+
+  info "  Subnet group: $subnet_group"
+  info "  Security group: $sg_id"
+
+  # Create the Aurora cluster
+  local create_cluster_out
+  create_cluster_out=$(aws_rds_direct create-db-cluster \
+    --region "$AWS_REGION" \
+    --db-cluster-identifier "$cluster_id" \
+    --engine aurora-postgresql \
+    --engine-version "$RDS_ENGINE_VERSION" \
+    --master-username "$RDS_MASTER_USER" \
+    --master-user-password "$RDS_MASTER_PASSWORD" \
+    --db-cluster-parameter-group-name "$pg_name" \
+    --db-subnet-group-name "$subnet_group" \
+    --vpc-security-group-ids "$sg_id" \
+    --backup-retention-period 7 \
+    --no-deletion-protection \
+    --output json 2>&1) || true
+
+  if echo "$create_cluster_out" | grep -q '"DBClusterIdentifier"'; then
+    record_check "PASS" "Aurora cluster created: $cluster_id" ""
   else
-    record_check "FAIL" "RDS creation failed" "$response"
+    record_check "FAIL" "Failed to create Aurora cluster" "$create_cluster_out"
+    return 1
+  fi
+
+  # Create the Aurora instance
+  local create_instance_out
+  create_instance_out=$(aws_rds_direct create-db-instance \
+    --region "$AWS_REGION" \
+    --db-instance-identifier "$instance_id" \
+    --db-cluster-identifier "$cluster_id" \
+    --db-instance-class db.t3.medium \
+    --engine aurora-postgresql \
+    --output json 2>&1) || true
+
+  if echo "$create_instance_out" | grep -q '"DBInstanceIdentifier"'; then
+    record_check "PASS" "Aurora instance created: $instance_id" ""
+  else
+    record_check "FAIL" "Failed to create Aurora instance" "$create_instance_out"
     return 1
   fi
 
