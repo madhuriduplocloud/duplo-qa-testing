@@ -125,14 +125,7 @@ jobs:
           # Resolve DuploCloud tenant ID
           TENANT_ID=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
             "$DUPLO_HOST/v3/admin/tenant" | \
-            python3 -c "
-import json, sys
-tenants = json.load(sys.stdin)
-for t in tenants:
-    if t.get('AccountName','').lower() == '${DUPLO_TENANT}'.lower():
-        print(t['TenantId'])
-        break
-")
+            jq -r --arg t "$DUPLO_TENANT" '.[] | select(.AccountName | ascii_downcase == ($t | ascii_downcase)) | .TenantId')
           echo "Tenant ID: $TENANT_ID"
 
           # Create Blue/Green deployment via DuploCloud API (so Duplo manages it and won't auto-delete it)
