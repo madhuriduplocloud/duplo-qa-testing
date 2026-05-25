@@ -122,21 +122,28 @@ jobs:
         run: |
           CLUSTER_ID="${{ steps.resolve.outputs.cluster_id }}"
 
-          # Get cluster ARN (required as --source)
-          CLUSTER_ARN=$(aws rds describe-db-clusters \
-            --db-cluster-identifier "$CLUSTER_ID" \
-            --query 'DBClusters[0].DBClusterArn' \
-            --output text --region "$AWS_REGION")
-          echo "Source cluster ARN: $CLUSTER_ARN"
+          # Resolve DuploCloud tenant ID
+          TENANT_ID=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "$DUPLO_HOST/v3/admin/tenant" | \
+            python3 -c "
+import json, sys
+tenants = json.load(sys.stdin)
+for t in tenants:
+    if t.get('AccountName','').lower() == '${DUPLO_TENANT}'.lower():
+        print(t['TenantId'])
+        break
+")
+          echo "Tenant ID: $TENANT_ID"
 
-          # Create the Blue/Green deployment
-          BG_JSON=$(aws rds create-blue-green-deployment \
-            --blue-green-deployment-name "${RDS_NAME}-bg" \
-            --source "$CLUSTER_ARN" \
-            --region "$AWS_REGION" \
-            --output json)
+          # Create Blue/Green deployment via DuploCloud API (so Duplo manages it and won't auto-delete it)
+          BG_JSON=$(curl -s -X POST \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"TargetEngineVersion\":\"${{ inputs.engine_version }}\"}" \
+            "$DUPLO_HOST/v3/subscriptions/$TENANT_ID/aws/rds/cluster/$CLUSTER_ID/bluegreen")
+          echo "DuploCloud response: $BG_JSON"
 
-          DEPLOYMENT_ID=$(echo "$BG_JSON" | jq -r '.BlueGreenDeployment.BlueGreenDeploymentIdentifier')
+          DEPLOYMENT_ID=$(echo "$BG_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['DeploymentId'])")
           echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
           echo "Deployment created: $DEPLOYMENT_ID"
 
@@ -257,3 +264,4 @@ jobs:
           name: rds-bluegreen-validation-${{ github.run_number }}
           path: /tmp/rds_bg_reports/
           retention-days: 30
+
