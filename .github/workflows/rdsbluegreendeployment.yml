@@ -6,7 +6,7 @@ on:
       tenant:
         description: "DuploCloud tenant name"
         required: true
-        default: "maja2205"
+        default: "maja2505"
       rds_name:
         description: "RDS short name (DuploCloud name, without duplo prefix)"
         required: true
@@ -31,6 +31,17 @@ on:
         description: "true = skip Phase 0, use existing RDS instance"
         required: false
         default: "false"
+      test_case:
+        description: |
+          Which test case to run:
+            positive-cli    = BUG1 fix check: create via CLI, verify DuploCloud does NOT delete it
+            positive-api    = BUG2 fix check: create via API, verify Green cluster is NOT deleted
+            positive-e2e    = Full E2E happy path via API (create → switchover → cleanup)
+            negative-no-replication = Switchover without logical replication enabled (expect graceful error)
+            negative-already-exists = Create B/G when one already exists (expect graceful error)
+            negative-invalid-version = Create B/G with invalid engine version (expect graceful error)
+        required: true
+        default: "positive-e2e"
 
 jobs:
   bluegreen-e2e:
@@ -45,6 +56,7 @@ jobs:
       AWS_REGION:   ${{ inputs.region }}
       DUPLO_TENANT: ${{ inputs.tenant }}
       RDS_NAME:     ${{ inputs.rds_name }}
+      TEST_CASE:    ${{ inputs.test_case }}
 
     steps:
       # -----------------------------------------------------------------------
@@ -91,7 +103,6 @@ jobs:
           echo "blue_instance=${BLUE_INSTANCE}" >> "$GITHUB_OUTPUT"
           echo "Blue instance: ${BLUE_INSTANCE}"
 
-          # Wait up to 5 min if still provisioning
           for i in $(seq 1 10); do
             STATUS=$(aws rds describe-db-instances \
               --db-instance-identifier "$BLUE_INSTANCE" \
@@ -108,7 +119,6 @@ jobs:
             exit 1
           fi
 
-          # Capture cluster identifier for Blue/Green creation
           CLUSTER_ID=$(aws rds describe-db-instances \
             --db-instance-identifier "$BLUE_INSTANCE" \
             --query 'DBInstances[0].DBClusterIdentifier' \
@@ -116,31 +126,139 @@ jobs:
           echo "cluster_id=${CLUSTER_ID}" >> "$GITHUB_OUTPUT"
           echo "Blue cluster: ${CLUSTER_ID}"
 
+      # =======================================================================
+      # NEGATIVE TEST: No logical replication
+      # Disable rds.logical_replication, attempt switchover, expect graceful error
+      # =======================================================================
+      - name: "[NEG] Disable logical replication"
+        if: env.TEST_CASE == 'negative-no-replication'
+        run: |
+          echo "Disabling rds.logical_replication to simulate missing prerequisite..."
+          PARAM_GROUP=$(aws rds describe-db-instances \
+            --db-instance-identifier "$RDS_NAME" \
+            --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' \
+            --output text --region "$AWS_REGION")
+          echo "Parameter group: $PARAM_GROUP"
+          aws rds modify-db-parameter-group \
+            --db-parameter-group-name "$PARAM_GROUP" \
+            --parameters "ParameterName=rds.logical_replication,ParameterValue=0,ApplyMethod=pending-reboot" \
+            --region "$AWS_REGION"
+          echo "Rebooting instance to apply..."
+          aws rds reboot-db-instance --db-instance-identifier "$RDS_NAME" --region "$AWS_REGION"
+          for i in $(seq 1 20); do
+            STATUS=$(aws rds describe-db-instances \
+              --db-instance-identifier "$RDS_NAME" \
+              --query 'DBInstances[0].DBInstanceStatus' \
+              --output text --region "$AWS_REGION")
+            echo "  [${i}] status: $STATUS"
+            [[ "$STATUS" == "available" ]] && break
+            sleep 30
+          done
+
+      # =======================================================================
+      # NEGATIVE TEST: Already exists
+      # Create a B/G deployment first, then try to create another one
+      # =======================================================================
+      - name: "[NEG] Create first B/G deployment (setup for already-exists test)"
+        if: env.TEST_CASE == 'negative-already-exists'
+        id: neg_first_bg
+        run: |
+          TENANT_ID=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "$DUPLO_HOST/v3/admin/tenant" | \
+            jq -r --arg t "$DUPLO_TENANT" '.[] | select(.AccountName | ascii_downcase == ($t | ascii_downcase)) | .TenantId')
+          CLUSTER_ID="${{ steps.resolve.outputs.cluster_id }}"
+
+          BG_JSON=$(curl -s -X POST \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"TargetEngineVersion\":\"${{ inputs.engine_version }}\"}" \
+            "$DUPLO_HOST/v3/subscriptions/$TENANT_ID/aws/rds/cluster/$CLUSTER_ID/bluegreen")
+          echo "First deployment response: $BG_JSON"
+          DEPLOYMENT_ID=$(echo "$BG_JSON" | jq -r '.DeploymentId // empty')
+          echo "first_deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Create Blue/Green Deployment (all cases except negative-already-exists second attempt)
       # -----------------------------------------------------------------------
       - name: Create Blue/Green Deployment
         id: create_bg
         run: |
           CLUSTER_ID="${{ steps.resolve.outputs.cluster_id }}"
 
-          # Resolve DuploCloud tenant ID
           TENANT_ID=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
             "$DUPLO_HOST/v3/admin/tenant" | \
             jq -r --arg t "$DUPLO_TENANT" '.[] | select(.AccountName | ascii_downcase == ($t | ascii_downcase)) | .TenantId')
           echo "Tenant ID: $TENANT_ID"
 
-          # Create Blue/Green deployment via DuploCloud API (so Duplo manages it and won't auto-delete it)
-          BG_JSON=$(curl -s -X POST \
-            -H "Authorization: Bearer $DUPLO_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"TargetEngineVersion\":\"${{ inputs.engine_version }}\"}" \
-            "$DUPLO_HOST/v3/subscriptions/$TENANT_ID/aws/rds/cluster/$CLUSTER_ID/bluegreen")
-          echo "DuploCloud response: $BG_JSON"
+          # ---- NEGATIVE: invalid engine version ----
+          if [[ "$TEST_CASE" == "negative-invalid-version" ]]; then
+            echo "Testing with invalid engine version 99.99 — expecting API error..."
+            RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"TargetEngineVersion":"99.99"}' \
+              "$DUPLO_HOST/v3/subscriptions/$TENANT_ID/aws/rds/cluster/$CLUSTER_ID/bluegreen")
+            echo "Response: $RESPONSE"
+            ERROR=$(echo "$RESPONSE" | jq -r '.error // .Error // .message // empty')
+            if [[ -n "$ERROR" ]]; then
+              echo "PASS: API returned expected error: $ERROR"
+              exit 0
+            else
+              echo "FAIL: Expected an error for invalid engine version but got: $RESPONSE"
+              exit 1
+            fi
+          fi
 
-          DEPLOYMENT_ID=$(echo "$BG_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['DeploymentId'])")
+          # ---- NEGATIVE: already exists — attempt second deployment ----
+          if [[ "$TEST_CASE" == "negative-already-exists" ]]; then
+            echo "Attempting to create second B/G deployment while one already exists..."
+            RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"TargetEngineVersion\":\"${{ inputs.engine_version }}\"}" \
+              "$DUPLO_HOST/v3/subscriptions/$TENANT_ID/aws/rds/cluster/$CLUSTER_ID/bluegreen")
+            echo "Response: $RESPONSE"
+            ERROR=$(echo "$RESPONSE" | jq -r '.error // .Error // .message // empty')
+            if [[ -n "$ERROR" ]]; then
+              echo "PASS: API returned expected error for duplicate deployment: $ERROR"
+              exit 0
+            else
+              echo "FAIL: Expected an error for duplicate B/G deployment but got: $RESPONSE"
+              exit 1
+            fi
+          fi
+
+          # ---- POSITIVE CLI: create via AWS CLI (BUG1 fix check) ----
+          if [[ "$TEST_CASE" == "positive-cli" ]]; then
+            echo "Creating B/G deployment via AWS CLI (BUG1 fix verification)..."
+            CLUSTER_ARN=$(aws rds describe-db-clusters \
+              --db-cluster-identifier "$CLUSTER_ID" \
+              --query 'DBClusters[0].DBClusterArn' \
+              --output text --region "$AWS_REGION")
+            BG_JSON=$(aws rds create-blue-green-deployment \
+              --blue-green-deployment-name "${RDS_NAME}-bg-cli-test" \
+              --source "$CLUSTER_ARN" \
+              --target-engine-version "${{ inputs.engine_version }}" \
+              --region "$AWS_REGION" --output json)
+            echo "AWS CLI response: $BG_JSON"
+            DEPLOYMENT_ID=$(echo "$BG_JSON" | jq -r '.BlueGreenDeployment.BlueGreenDeploymentIdentifier')
+
+          # ---- POSITIVE API / E2E: create via DuploCloud API (BUG2 fix check) ----
+          else
+            echo "Creating B/G deployment via DuploCloud API..."
+            BG_JSON=$(curl -s -X POST \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"TargetEngineVersion\":\"${{ inputs.engine_version }}\"}" \
+              "$DUPLO_HOST/v3/subscriptions/$TENANT_ID/aws/rds/cluster/$CLUSTER_ID/bluegreen")
+            echo "DuploCloud response: $BG_JSON"
+            DEPLOYMENT_ID=$(echo "$BG_JSON" | jq -r '.DeploymentId')
+          fi
+
           echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
           echo "Deployment created: $DEPLOYMENT_ID"
 
-          # Wait for AVAILABLE (up to 35 min, poll every 30s)
+          # Wait for AVAILABLE (up to 35 min)
           echo "Waiting for Blue/Green deployment to become AVAILABLE..."
           for i in $(seq 1 70); do
             STATUS=$(aws rds describe-blue-green-deployments \
@@ -161,7 +279,6 @@ jobs:
             exit 1
           fi
 
-          # Discover the Green instance identifier from SwitchoverDetails
           GREEN_INSTANCE=$(aws rds describe-blue-green-deployments \
             --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
             --region "$AWS_REGION" \
@@ -170,8 +287,77 @@ jobs:
           echo "green_instance=${GREEN_INSTANCE}" >> "$GITHUB_OUTPUT"
           echo "Green instance: $GREEN_INSTANCE"
 
+      # =======================================================================
+      # POSITIVE CLI — BUG1 Fix Verification
+      # Monitor for 5 min to confirm DuploCloud does NOT delete the CLI-created deployment
+      # =======================================================================
+      - name: "[POS-CLI] Verify DuploCloud does NOT delete CLI-created deployment (BUG1 fix check)"
+        if: env.TEST_CASE == 'positive-cli'
+        run: |
+          DEPLOYMENT_ID="${{ steps.create_bg.outputs.deployment_id }}"
+          echo "Monitoring deployment $DEPLOYMENT_ID for 5 minutes to verify it is NOT deleted..."
+          echo "If DuploCloud deletes it, this step will FAIL — BUG1 is NOT fixed."
+          echo ""
+
+          for i in $(seq 1 10); do
+            STATUS=$(aws rds describe-blue-green-deployments \
+              --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+              --query 'BlueGreenDeployments[0].Status' \
+              --output text --region "$AWS_REGION" 2>/dev/null || echo "DELETED")
+            echo "  [${i}/10] $((i * 30))s — Status: $STATUS"
+
+            if [[ "$STATUS" == "DELETED" || -z "$STATUS" ]]; then
+              echo ""
+              echo "FAIL: Deployment was deleted by DuploCloud — BUG1 is NOT fixed!"
+              exit 1
+            fi
+            sleep 30
+          done
+
+          echo ""
+          echo "PASS: Deployment survived 5 minutes without being deleted by DuploCloud — BUG1 is FIXED!"
+
+      # =======================================================================
+      # POSITIVE API — BUG2 Fix Verification
+      # Monitor Green cluster for 5 min to confirm DuploCloud does NOT delete it
+      # =======================================================================
+      - name: "[POS-API] Verify Green cluster is NOT deleted by DuploCloud (BUG2 fix check)"
+        if: env.TEST_CASE == 'positive-api'
+        run: |
+          DEPLOYMENT_ID="${{ steps.create_bg.outputs.deployment_id }}"
+          echo "Fetching Green cluster name..."
+          GREEN_CLUSTER=$(aws rds describe-blue-green-deployments \
+            --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+            --region "$AWS_REGION" \
+            --query 'BlueGreenDeployments[0].Target' \
+            --output text 2>/dev/null | sed 's/.*:cluster://')
+          echo "Green cluster: $GREEN_CLUSTER"
+          echo ""
+          echo "Monitoring Green cluster for 5 minutes to verify it is NOT deleted..."
+          echo "If DuploCloud deletes it, this step will FAIL — BUG2 is NOT fixed."
+          echo ""
+
+          for i in $(seq 1 10); do
+            STATUS=$(aws rds describe-db-clusters \
+              --db-cluster-identifier "$GREEN_CLUSTER" \
+              --query 'DBClusters[0].Status' \
+              --output text --region "$AWS_REGION" 2>/dev/null || echo "DELETED")
+            echo "  [${i}/10] $((i * 30))s — Green cluster status: $STATUS"
+
+            if [[ "$STATUS" == "DELETED" || -z "$STATUS" ]]; then
+              echo ""
+              echo "FAIL: Green cluster was deleted by DuploCloud — BUG2 is NOT fixed!"
+              exit 1
+            fi
+            sleep 30
+          done
+
+          echo ""
+          echo "PASS: Green cluster survived 5 minutes without being deleted — BUG2 is FIXED!"
+
       # -----------------------------------------------------------------------
       - name: Phase 1 — Pre-Switchover Validation
+        if: env.TEST_CASE == 'positive-e2e' || env.TEST_CASE == 'negative-no-replication'
         run: |
           bash validate_rds_blue_green.sh \
             --blue-instance  "${{ steps.resolve.outputs.blue_instance }}"  \
@@ -188,16 +374,35 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Switchover — Promote Green to Primary
         id: switchover
+        if: env.TEST_CASE == 'positive-e2e' || env.TEST_CASE == 'negative-no-replication'
         run: |
           DEPLOYMENT_ID="${{ steps.create_bg.outputs.deployment_id }}"
           echo "Initiating switchover for $DEPLOYMENT_ID ..."
+
+          # NEGATIVE: no-replication test expects this to fail
+          if [[ "$TEST_CASE" == "negative-no-replication" ]]; then
+            echo "Expecting switchover to fail due to missing logical replication..."
+            set +e
+            aws rds switchover-blue-green-deployment \
+              --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
+              --switchover-timeout 300 \
+              --region "$AWS_REGION" 2>&1
+            EXIT_CODE=$?
+            set -e
+            if [[ $EXIT_CODE -ne 0 ]]; then
+              echo "PASS: Switchover failed as expected due to missing logical replication."
+              exit 0
+            else
+              echo "FAIL: Switchover succeeded but should have failed without logical replication."
+              exit 1
+            fi
+          fi
 
           aws rds switchover-blue-green-deployment \
             --blue-green-deployment-identifier "$DEPLOYMENT_ID" \
             --switchover-timeout 300 \
             --region "$AWS_REGION"
 
-          # Wait for SWITCHOVER_COMPLETED (up to 5 min, poll every 15s)
           echo "Waiting for switchover to complete..."
           for i in $(seq 1 20); do
             STATUS=$(aws rds describe-blue-green-deployments \
@@ -217,6 +422,7 @@ jobs:
 
       # -----------------------------------------------------------------------
       - name: Phase 2 + 3 — Post-Switchover Validation + Monitoring
+        if: env.TEST_CASE == 'positive-e2e'
         run: |
           bash validate_rds_blue_green.sh \
             --blue-instance  "${{ steps.resolve.outputs.blue_instance }}"    \
@@ -257,4 +463,3 @@ jobs:
           name: rds-bluegreen-validation-${{ github.run_number }}
           path: /tmp/rds_bg_reports/
           retention-days: 30
-
