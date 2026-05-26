@@ -62,7 +62,6 @@ jobs:
 
       # ── Step 2: Create Test VM via DuploCloud ─────────────────────────────────
       - name: Create Test VM
-        id: create_vm
         run: |
           python3 - <<'PY'
           import os, requests, sys, json
@@ -74,37 +73,33 @@ jobs:
           headers   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
           payload = {
-              "FriendlyName": host_name,
-              "Capacity":     vm_size,
+              "FriendlyName":  host_name,
+              "Capacity":      vm_size,
               "AgentPlatform": 0,
-              "ImageId":      "Ubuntu Server 22.04 LTS",
-              "Cloud":        8,
+              "ImageId":       "Ubuntu Server 22.04 LTS",
+              "Cloud":         8,
           }
-
           r = requests.post(
               f"{host}/subscriptions/{tenant_id}/v2/nativeHost",
-              headers=headers,
-              json=payload,
-              timeout=60
+              headers=headers, json=payload, timeout=60
           )
           if not r.ok:
               print(f"Failed to create VM: {r.status_code} {r.text}", file=sys.stderr)
               sys.exit(1)
           print(f"VM creation initiated: {host_name}")
-          print(json.dumps(r.json(), indent=2))
           PY
         env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-          HOST_NAME: ${{ github.event.inputs.host_name }}
-          VM_SIZE:   ${{ github.event.inputs.vm_size }}
+          TENANT_ID:    ${{ steps.tenant.outputs.tenant_id }}
+          DUPLO_TOKEN:  ${{ secrets.DUPLO_TOKEN }}
+          HOST_NAME:    ${{ github.event.inputs.host_name }}
+          VM_SIZE:      ${{ github.event.inputs.vm_size }}
 
-      # ── Step 3: Wait for VM to reach Running state ────────────────────────────
+      # ── Step 3: Wait for VM Running ───────────────────────────────────────────
       - name: Wait for VM Running
         id: wait_running
         run: |
           python3 - <<'PY'
-          import os, requests, sys, time, json
+          import os, requests, sys, time
           host      = os.environ["DUPLO_HOST"]
           tenant_id = os.environ["TENANT_ID"]
           token     = os.environ["DUPLO_TOKEN"]
@@ -115,8 +110,7 @@ jobs:
           for attempt in range(30):
               r = requests.get(f"{host}/subscriptions/{tenant_id}/v2/nativeHost", headers=headers, timeout=30)
               if r.ok:
-                  hosts = r.json() or []
-                  for h in hosts:
+                  for h in (r.json() or []):
                       if h.get("FriendlyName", "").lower() == host_name:
                           status = h.get("Status", "")
                           ip     = h.get("PrivateIpAddress", "")
@@ -125,43 +119,45 @@ jobs:
                               print(f"VM is Running. IP: {ip}")
                               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                                   f.write(f"vm_ip={ip}\n")
-                                  f.write(f"vm_name={h.get('InstanceId', host_name)}\n")
                               sys.exit(0)
               time.sleep(20)
-
           print("Timed out waiting for VM to reach Running state", file=sys.stderr)
           sys.exit(1)
           PY
         env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-          HOST_NAME: ${{ github.event.inputs.host_name }}
+          TENANT_ID:    ${{ steps.tenant.outputs.tenant_id }}
+          DUPLO_TOKEN:  ${{ secrets.DUPLO_TOKEN }}
+          HOST_NAME:    ${{ github.event.inputs.host_name }}
 
       - name: Log VM Details
         run: |
           echo "VM Name : ${{ github.event.inputs.host_name }}"
           echo "VM IP   : ${{ steps.wait_running.outputs.vm_ip }}"
 
-      # ── Step 4: Delete VM directly from Azure (simulate orphan) ──────────────
-      - name: Delete VM from Azure (simulate orphan)
+      # ── Step 4: Delete VM directly from Azure via DuploMaster SSH ────────────
+      # SSH into DuploMaster VM (which has managed identity with Contributor access)
+      # and delete the VM directly from Azure — bypassing DuploCloud to create orphan.
+      - name: Setup SSH key
         run: |
-          az login --service-principal \
-            -u "${{ secrets.AZURE_CLIENT_ID }}" \
-            -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
-            --tenant "${{ secrets.AZURE_TENANT_ID }}" \
-            --output none
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AZURE_MASTER_SSH_KEY }}" > ~/.ssh/duplomaster.pem
+          chmod 600 ~/.ssh/duplomaster.pem
+          ssh-keyscan -H "${{ secrets.AZURE_MASTER_VM_IP }}" >> ~/.ssh/known_hosts 2>/dev/null
 
+      - name: Delete VM from Azure via DuploMaster (simulate orphan)
+        run: |
           RESOURCE_GROUP="duploservices-${{ github.event.inputs.tenant_name }}"
           VM_NAME="duploservices-${{ github.event.inputs.tenant_name }}-${{ github.event.inputs.host_name }}"
 
-          echo "Deleting VM '$VM_NAME' from resource group '$RESOURCE_GROUP' directly via Azure..."
-          az vm delete \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$VM_NAME" \
-            --yes \
-            --output none
-
-          echo "Azure VM deleted. Orphan minion entry should now exist in DuploCloud."
+          ssh -i ~/.ssh/duplomaster.pem \
+              -o StrictHostKeyChecking=no \
+              azureuser@${{ secrets.AZURE_MASTER_VM_IP }} \
+              "az vm delete \
+                --resource-group '$RESOURCE_GROUP' \
+                --name '$VM_NAME' \
+                --yes \
+                --output none && \
+               echo 'Azure VM deleted. Orphan minion entry now exists in DuploCloud.'"
 
       # ── Step 5: Verify orphan minion still exists in DuploCloud ──────────────
       - name: Verify Orphan Minion Exists in DuploCloud
@@ -178,19 +174,17 @@ jobs:
           if not r.ok:
               print(f"API error: {r.status_code}", file=sys.stderr)
               sys.exit(1)
-
-          hosts = r.json() or []
-          found = any(h.get("FriendlyName", "").lower() == host_name for h in hosts)
+          found = any(h.get("FriendlyName", "").lower() == host_name for h in (r.json() or []))
           if found:
               print(f"Orphan confirmed: '{host_name}' still exists in DuploCloud after Azure deletion.")
           else:
-              print(f"WARNING: '{host_name}' not found in DuploCloud — orphan may have already been cleaned up or was never created.", file=sys.stderr)
+              print(f"WARNING: '{host_name}' not found — orphan may have already been cleaned up.", file=sys.stderr)
               sys.exit(1)
           PY
         env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-          HOST_NAME: ${{ github.event.inputs.host_name }}
+          TENANT_ID:    ${{ steps.tenant.outputs.tenant_id }}
+          DUPLO_TOKEN:  ${{ secrets.DUPLO_TOKEN }}
+          HOST_NAME:    ${{ github.event.inputs.host_name }}
 
       # ── Step 6: Wait for reconciliation worker to clean up orphan ─────────────
       - name: Wait for Reconciliation Worker to Clean Up Orphan
@@ -204,35 +198,32 @@ jobs:
           wait_secs = int(os.environ["RECONCILE_WAIT"])
           headers   = {"Authorization": f"Bearer {token}"}
 
-          print(f"Polling for orphan cleanup (max {wait_secs}s)...")
-          elapsed = 0
-          interval = 30
+          print(f"Polling for orphan cleanup (max {wait_secs}s, every 30s)...")
+          elapsed, interval = 0, 30
           while elapsed < wait_secs:
               time.sleep(interval)
               elapsed += interval
               r = requests.get(f"{host}/subscriptions/{tenant_id}/v2/nativeHost", headers=headers, timeout=30)
               if r.ok:
-                  hosts = r.json() or []
-                  found = any(h.get("FriendlyName", "").lower() == host_name for h in hosts)
+                  found = any(h.get("FriendlyName", "").lower() == host_name for h in (r.json() or []))
                   if not found:
-                      print(f"Orphan '{host_name}' cleaned up after {elapsed}s. Reconciliation worker fired successfully.")
+                      print(f"Orphan cleaned up after {elapsed}s. Reconciliation worker fired successfully.")
                       sys.exit(0)
                   print(f"  [{elapsed}s] Orphan still present, waiting...")
-
-          print(f"Timed out after {wait_secs}s — orphan '{host_name}' was NOT cleaned up by the reconciliation worker.", file=sys.stderr)
+          print(f"Timed out after {wait_secs}s — orphan was NOT cleaned up by reconciliation worker.", file=sys.stderr)
           sys.exit(1)
           PY
         env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-          HOST_NAME: ${{ github.event.inputs.host_name }}
+          TENANT_ID:      ${{ steps.tenant.outputs.tenant_id }}
+          DUPLO_TOKEN:    ${{ secrets.DUPLO_TOKEN }}
+          HOST_NAME:      ${{ github.event.inputs.host_name }}
           RECONCILE_WAIT: ${{ github.event.inputs.reconcile_wait_seconds }}
 
       # ── Step 7: Redeploy VM with same name ───────────────────────────────────
       - name: Redeploy VM with Same Name
         run: |
           python3 - <<'PY'
-          import os, requests, sys, json
+          import os, requests, sys
           host      = os.environ["DUPLO_HOST"]
           tenant_id = os.environ["TENANT_ID"]
           token     = os.environ["DUPLO_TOKEN"]
@@ -241,18 +232,15 @@ jobs:
           headers   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
           payload = {
-              "FriendlyName": host_name,
-              "Capacity":     vm_size,
+              "FriendlyName":  host_name,
+              "Capacity":      vm_size,
               "AgentPlatform": 0,
-              "ImageId":      "Ubuntu Server 22.04 LTS",
-              "Cloud":        8,
+              "ImageId":       "Ubuntu Server 22.04 LTS",
+              "Cloud":         8,
           }
-
           r = requests.post(
               f"{host}/subscriptions/{tenant_id}/v2/nativeHost",
-              headers=headers,
-              json=payload,
-              timeout=60
+              headers=headers, json=payload, timeout=60
           )
           if not r.ok:
               print(f"FAIL: Redeployment rejected — {r.status_code} {r.text}", file=sys.stderr)
@@ -260,12 +248,12 @@ jobs:
           print(f"Redeployment accepted for '{host_name}'. Happy path confirmed — no conflict error.")
           PY
         env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-          HOST_NAME: ${{ github.event.inputs.host_name }}
-          VM_SIZE:   ${{ github.event.inputs.vm_size }}
+          TENANT_ID:    ${{ steps.tenant.outputs.tenant_id }}
+          DUPLO_TOKEN:  ${{ secrets.DUPLO_TOKEN }}
+          HOST_NAME:    ${{ github.event.inputs.host_name }}
+          VM_SIZE:      ${{ github.event.inputs.vm_size }}
 
-      # ── Step 8: Wait for redeployed VM to reach Running state ─────────────────
+      # ── Step 8: Wait for redeployed VM Running ────────────────────────────────
       - name: Wait for Redeployed VM Running
         run: |
           python3 - <<'PY'
@@ -289,14 +277,13 @@ jobs:
                               print(f"Redeployed VM is Running. IP: {ip}")
                               sys.exit(0)
               time.sleep(20)
-
           print("Timed out waiting for redeployed VM to reach Running state", file=sys.stderr)
           sys.exit(1)
           PY
         env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-          HOST_NAME: ${{ github.event.inputs.host_name }}
+          TENANT_ID:    ${{ steps.tenant.outputs.tenant_id }}
+          DUPLO_TOKEN:  ${{ secrets.DUPLO_TOKEN }}
+          HOST_NAME:    ${{ github.event.inputs.host_name }}
 
       # ── Step 9: Summary ───────────────────────────────────────────────────────
       - name: Test Summary
@@ -307,7 +294,7 @@ jobs:
           echo "| Step | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| VM created in DuploCloud | ✅ |" >> $GITHUB_STEP_SUMMARY
-          echo "| VM deleted directly from Azure (orphan triggered) | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| VM deleted directly from Azure via DuploMaster (orphan triggered) | ✅ |" >> $GITHUB_STEP_SUMMARY
           echo "| Orphan minion confirmed in DuploCloud | ✅ |" >> $GITHUB_STEP_SUMMARY
           echo "| Reconciliation worker cleaned up orphan | ✅ |" >> $GITHUB_STEP_SUMMARY
           echo "| VM redeployed with same name (no conflict) | ✅ |" >> $GITHUB_STEP_SUMMARY
@@ -321,7 +308,7 @@ jobs:
         if: always()
         run: |
           python3 - <<'PY'
-          import os, requests, sys
+          import os, requests
           host      = os.environ["DUPLO_HOST"]
           tenant_id = os.environ["TENANT_ID"]
           token     = os.environ["DUPLO_TOKEN"]
@@ -330,8 +317,7 @@ jobs:
 
           r = requests.delete(
               f"{host}/subscriptions/{tenant_id}/v2/nativeHost/{host_name}",
-              headers=headers,
-              timeout=30
+              headers=headers, timeout=30
           )
           if r.ok:
               print(f"Cleanup: VM '{host_name}' deleted via DuploCloud.")
@@ -339,6 +325,11 @@ jobs:
               print(f"Cleanup warning: {r.status_code} {r.text}")
           PY
         env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
-          DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
-          HOST_NAME: ${{ github.event.inputs.host_name }}
+          TENANT_ID:    ${{ steps.tenant.outputs.tenant_id }}
+          DUPLO_TOKEN:  ${{ secrets.DUPLO_TOKEN }}
+          HOST_NAME:    ${{ github.event.inputs.host_name }}
+
+      # ── Cleanup SSH key ───────────────────────────────────────────────────────
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/duplomaster.pem
