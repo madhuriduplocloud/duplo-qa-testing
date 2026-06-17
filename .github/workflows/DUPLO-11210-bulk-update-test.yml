@@ -171,6 +171,41 @@ jobs:
           echo "Test 1 — PASS: $PASS  FAIL: $FAIL"
           [ "$FAIL" -eq 0 ] || exit 1
 
+      - name: TEST 1b — Wait 2 min then verify services remain stopped (not auto-recovered)
+        id: test1b
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          COUNT=${{ github.event.inputs.service_count }}
+          PREFIX="${SERVICE_PREFIX}"
+
+          echo "⏳ Waiting 2 minutes to confirm services stay at 0 replicas..."
+          for i in $(seq 120 -10 10); do
+            echo "  $i seconds remaining..."
+            sleep 10
+          done
+          echo "✅ Wait complete. Checking replica counts..."
+
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 $COUNT); do
+            NAME="${PREFIX}-${i}"
+            REPLICAS=$(curl -s \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
+            if [ "$REPLICAS" = "0" ]; then
+              echo "  ✅ $NAME: still at Replicas=0 (not auto-recovered)"
+              ((PASS++))
+            else
+              echo "  ❌ $NAME: Replicas auto-recovered to $REPLICAS — unexpected!"
+              ((FAIL++))
+            fi
+          done
+          echo "TEST1B_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST1B_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 1b — PASS: $PASS  FAIL: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
+
       - name: TEST 2 — BulkChange all ${{ github.event.inputs.service_count }} services 0→1 (single API call)
         id: test2
         env:
@@ -285,8 +320,8 @@ jobs:
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          TOTAL_PASS=$(( ${TEST1_PASS:-0} + ${TEST2_PASS:-0} + ${TEST3_PASS:-0} ))
-          TOTAL_FAIL=$(( ${TEST1_FAIL:-0} + ${TEST2_FAIL:-0} + ${TEST3_FAIL:-0} ))
+          TOTAL_PASS=$(( ${TEST1_PASS:-0} + ${TEST1B_PASS:-0} + ${TEST2_PASS:-0} + ${TEST3_PASS:-0} ))
+          TOTAL_FAIL=$(( ${TEST1_FAIL:-0} + ${TEST1B_FAIL:-0} + ${TEST2_FAIL:-0} + ${TEST3_FAIL:-0} ))
           STATUS=$( [ "$TOTAL_FAIL" -eq 0 ] && echo "✅ All tests passed" || echo "❌ Some tests failed" )
 
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
@@ -307,6 +342,7 @@ jobs:
           | Test | Description | Endpoint | Pass | Fail |
           |------|-------------|----------|------|------|
           | 1 | All ${{ github.event.inputs.service_count }} services 1→0 (parallel) | \`BulkChangeAll\` | ${TEST1_PASS:-0} | ${TEST1_FAIL:-0} |
+          | 1b | Wait 2 min — services stay stopped (no auto-recovery) | — | ${TEST1B_PASS:-0} | ${TEST1B_FAIL:-0} |
           | 2 | All ${{ github.event.inputs.service_count }} services 0→1 (parallel) | \`BulkChange\` | ${TEST2_PASS:-0} | ${TEST2_FAIL:-0} |
           | 3 | Omit Replicas — none should zero out | \`BulkChangeAll\` | ${TEST3_PASS:-0} | ${TEST3_FAIL:-0} |
           | **Total** | | | **$TOTAL_PASS** | **$TOTAL_FAIL** |
