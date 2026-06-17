@@ -1,0 +1,313 @@
+name: DUPLO-11210 — Null Replicas Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "DuploCloud portal URL"
+        required: true
+        default: "https://oneclick.duplocloud.net"
+      tenant_name:
+        description: "Tenant name"
+        required: true
+        default: "maja1706"
+      service_prefix:
+        description: "Test service name prefix"
+        required: false
+        default: "null-repl-test"
+      image:
+        description: "Container image"
+        required: false
+        default: "nginx:latest"
+
+env:
+  DUPLO_HOST: ${{ github.event.inputs.host }}
+  DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+  TENANT_NAME: ${{ github.event.inputs.tenant_name }}
+  PREFIX: ${{ github.event.inputs.service_prefix }}
+  IMAGE: ${{ github.event.inputs.image }}
+
+jobs:
+  null-replicas-test:
+    name: Null Replicas — explicit null vs omit vs zero
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate token and resolve tenant ID
+        id: tenant
+        run: |
+          if [ -z "$DUPLO_TOKEN" ]; then
+            echo "❌ DUPLO_TOKEN secret is not set."; exit 1
+          fi
+          HTTP=$(curl -s -o /tmp/tenants.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/v3/admin/tenant")
+          if [ "$HTTP" = "401" ]; then
+            echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."; exit 1
+          elif [ "$HTTP" != "200" ]; then
+            echo "❌ Unexpected HTTP $HTTP"; cat /tmp/tenants.json; exit 1
+          fi
+          TENANT_ID=$(python3 - <<'PY'
+          import json, sys, os
+          tenant = os.environ["TENANT_NAME"].lower()
+          data = json.load(open("/tmp/tenants.json"))
+          for t in data:
+              if t.get("AccountName", "").lower() == tenant:
+                  print(t["TenantId"]); sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr); sys.exit(1)
+          PY
+          )
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
+          echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
+
+      # ── Create test service at 2 replicas ─────────────────────────────────
+      - name: Create test service with Replicas=2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-svc"
+          echo "Creating ${SVC} with Replicas=2..."
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+            -d "{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":2,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}")
+          echo "  HTTP: $HTTP"
+
+          # Poll until visible at 2
+          for attempt in $(seq 1 12); do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            [ "$R" = "2" ] && break
+            echo "  Waiting... Replicas=$R"; sleep 5
+          done
+          echo "✅ ${SVC} ready at Replicas=2"
+
+      # ── TC1: ReplicationControllerChangeAll with Replicas=null ────────────
+      - name: "TC1 — ChangeAll with Replicas=null — must not change count (stay 2)"
+        id: tc1
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-svc"
+          echo "Sending ChangeAll with explicit Replicas=null..."
+          BODY="{\"Name\":\"${SVC}\",\"Replicas\":null,\"TenantId\":\"${TENANT_ID}\"}"
+          echo "  Payload: $BODY"
+          HTTP=$(curl -s -o /tmp/tc1.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "$BODY")
+          echo "  HTTP: $HTTP"
+          echo "  Response: $(cat /tmp/tc1.json)"
+          sleep 5
+
+          R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+          echo "  Replicas after null update: $R (expected 2)"
+
+          if [ "$R" = "2" ]; then
+            echo "✅ TC1 PASS — Replicas stayed at 2 (null treated as no-op)"
+            echo "TC1=PASS" >> "$GITHUB_ENV"
+          elif [ "$R" = "0" ]; then
+            echo "❌ TC1 FAIL — Replicas dropped to 0 (null treated as zero!)"
+            echo "TC1=FAIL (null zeroed replicas)" >> "$GITHUB_ENV"
+            # Reset and continue
+            curl -s -o /dev/null -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+              -d "{\"Name\":\"${SVC}\",\"Replicas\":2,\"TenantId\":\"${TENANT_ID}\"}"
+            sleep 5
+          else
+            echo "❌ TC1 FAIL — Unexpected Replicas=$R"
+            echo "TC1=FAIL (unexpected: $R)" >> "$GITHUB_ENV"
+          fi
+
+      # ── TC2: BulkChangeAll with Replicas=null ─────────────────────────────
+      - name: "TC2 — BulkChangeAll with Replicas=null — must not change count (stay 2)"
+        id: tc2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-svc"
+          echo "Sending BulkChangeAll with explicit Replicas=null..."
+          BODY="[{\"Name\":\"${SVC}\",\"Replicas\":null,\"TenantId\":\"${TENANT_ID}\"}]"
+          echo "  Payload: $BODY"
+          HTTP=$(curl -s -o /tmp/tc2.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChangeAll" \
+            -d "$BODY")
+          echo "  HTTP: $HTTP"
+          echo "  Response: $(cat /tmp/tc2.json)"
+          sleep 5
+
+          R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+          echo "  Replicas after null bulk update: $R (expected 2)"
+
+          if [ "$R" = "2" ]; then
+            echo "✅ TC2 PASS — Replicas stayed at 2 (null treated as no-op)"
+            echo "TC2=PASS" >> "$GITHUB_ENV"
+          elif [ "$R" = "0" ]; then
+            echo "❌ TC2 FAIL — Replicas dropped to 0 (null treated as zero!)"
+            echo "TC2=FAIL (null zeroed replicas)" >> "$GITHUB_ENV"
+            curl -s -o /dev/null -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+              -d "{\"Name\":\"${SVC}\",\"Replicas\":2,\"TenantId\":\"${TENANT_ID}\"}"
+            sleep 5
+          else
+            echo "❌ TC2 FAIL — Unexpected Replicas=$R"
+            echo "TC2=FAIL (unexpected: $R)" >> "$GITHUB_ENV"
+          fi
+
+      # ── TC3: Create service with Replicas=null ────────────────────────────
+      - name: "TC3 — Create new service with Replicas=null (should use default or error)"
+        id: tc3
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-null-create"
+          echo "Creating ${SVC} with explicit Replicas=null..."
+          BODY="{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":null,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}"
+          echo "  Payload: $BODY"
+          HTTP=$(curl -s -o /tmp/tc3.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+            -d "$BODY")
+          echo "  HTTP: $HTTP"
+          echo "  Response: $(cat /tmp/tc3.json)"
+
+          sleep 5
+          R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+          echo "  Replicas after null-create: '$R' (HTTP was $HTTP)"
+
+          if [ "$HTTP" != "200" ]; then
+            echo "ℹ️  TC3 — API rejected null Replicas on create (HTTP $HTTP) — treated as invalid input"
+            echo "TC3=INFO (rejected, HTTP $HTTP)" >> "$GITHUB_ENV"
+          elif [ "$R" = "0" ]; then
+            echo "⚠️  TC3 — Service created with Replicas=0 (null defaulted to 0)"
+            echo "TC3=INFO (created with Replicas=0)" >> "$GITHUB_ENV"
+          elif [ -n "$R" ]; then
+            echo "ℹ️  TC3 — Service created with Replicas=$R (null defaulted to $R)"
+            echo "TC3=INFO (created with Replicas=$R)" >> "$GITHUB_ENV"
+          else
+            echo "ℹ️  TC3 — Service not visible after creation with null Replicas"
+            echo "TC3=INFO (not created)" >> "$GITHUB_ENV"
+          fi
+
+      # ── TC4: Compare null vs omit — should behave identically ─────────────
+      - name: "TC4 — Compare: null Replicas vs omitting Replicas field (must behave same)"
+        id: tc4
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-svc"
+
+          # Ensure at 2
+          curl -s -o /dev/null -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":2,\"TenantId\":\"${TENANT_ID}\"}"
+          sleep 5
+
+          # Update with null Replicas
+          curl -s -o /tmp/tc4_null.json \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":null,\"TenantId\":\"${TENANT_ID}\"}"
+          sleep 5
+          R_NULL=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+
+          # Reset to 2
+          curl -s -o /dev/null -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":2,\"TenantId\":\"${TENANT_ID}\"}"
+          sleep 5
+
+          # Update with Replicas field omitted
+          curl -s -o /tmp/tc4_omit.json \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"TenantId\":\"${TENANT_ID}\"}"
+          sleep 5
+          R_OMIT=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+
+          echo "  Replicas after null  : $R_NULL"
+          echo "  Replicas after omit  : $R_OMIT"
+
+          if [ "$R_NULL" = "$R_OMIT" ]; then
+            echo "✅ TC4 PASS — null and omit behave identically (both give Replicas=$R_NULL)"
+            echo "TC4=PASS (null=$R_NULL, omit=$R_OMIT)" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC4 FAIL — null ($R_NULL) and omit ($R_OMIT) behave differently!"
+            echo "TC4=FAIL (null=$R_NULL vs omit=$R_OMIT)" >> "$GITHUB_ENV"
+          fi
+
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Delete test services (cleanup)
+        if: always()
+        run: |
+          pip install -q duplocloud-client
+          DC="duploctl --host $DUPLO_HOST --token $DUPLO_TOKEN --tenant $TENANT_NAME"
+          for SVC in "${PREFIX}-svc" "${PREFIX}-null-create"; do
+            if $DC service delete "$SVC" > /dev/null 2>&1; then
+              echo "  🗑️  Deleted $SVC"
+            else
+              echo "  ⚠️  Could not delete $SVC (may not exist)"
+            fi
+          done
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          result() {
+            case "$1" in
+              PASS*) echo "✅ $1" ;;
+              FAIL*) echo "❌ $1" ;;
+              INFO*) echo "ℹ️  $1" ;;
+              *)     echo "⏭️  SKIP" ;;
+            esac
+          }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## DUPLO-11210 — Null Replicas Test Results
+
+          **Host:** ${{ github.event.inputs.host }}
+          **Tenant:** ${{ github.event.inputs.tenant_name }}
+          **Feature flag:** \`EnableDuploServiceScalingToZero\`
+
+          Tests what happens when \`Replicas: null\` is **explicitly** sent in the JSON payload
+          (as opposed to omitting the field or sending \`Replicas: 0\`).
+
+          | TC | Endpoint | Payload | Expected | Result |
+          |----|----------|---------|----------|--------|
+          | TC1 | \`ReplicationControllerChangeAll\` | \`Replicas: null\` | Replicas unchanged (stay 2) | $(result "${TC1:-}") |
+          | TC2 | \`ReplicationControllerBulkChangeAll\` | \`Replicas: null\` | Replicas unchanged (stay 2) | $(result "${TC2:-}") |
+          | TC3 | \`ReplicationControllerUpdate\` (create) | \`Replicas: null\` | Default or error | $(result "${TC3:-}") |
+          | TC4 | \`ReplicationControllerChangeAll\` | null vs omit | Identical behavior | $(result "${TC4:-}") |
+
+          ### Key distinction
+          - \`Replicas: 0\` → intentionally stop the service ✅ (PR fix)
+          - \`Replicas: null\` → should be treated same as omitting the field (no change)
+          - Omitting \`Replicas\` → no change to current count
+          EOF
