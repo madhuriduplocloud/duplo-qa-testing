@@ -193,18 +193,15 @@ jobs:
             python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
           echo "  Replicas after null-create: '$R' (HTTP was $HTTP)"
 
-          if [ "$HTTP" != "200" ]; then
-            echo "ℹ️  TC3 — API rejected null Replicas on create (HTTP $HTTP) — treated as invalid input"
-            echo "TC3=INFO (rejected, HTTP $HTTP)" >> "$GITHUB_ENV"
-          elif [ "$R" = "0" ]; then
-            echo "⚠️  TC3 — Service created with Replicas=0 (null defaulted to 0)"
-            echo "TC3=INFO (created with Replicas=0)" >> "$GITHUB_ENV"
-          elif [ -n "$R" ]; then
-            echo "ℹ️  TC3 — Service created with Replicas=$R (null defaulted to $R)"
-            echo "TC3=INFO (created with Replicas=$R)" >> "$GITHUB_ENV"
+          if [ "$HTTP" = "200" ] && [ "$R" = "0" ]; then
+            echo "✅ TC3 PASS — Service created with Replicas=0 (null defaults to 0, existing behaviour)"
+            echo "TC3=PASS (null on create → Replicas=0)" >> "$GITHUB_ENV"
+          elif [ "$HTTP" = "200" ] && [ -n "$R" ]; then
+            echo "❌ TC3 FAIL — Expected Replicas=0, got Replicas=$R"
+            echo "TC3=FAIL (expected 0, got $R)" >> "$GITHUB_ENV"; exit 1
           else
-            echo "ℹ️  TC3 — Service not visible after creation with null Replicas"
-            echo "TC3=INFO (not created)" >> "$GITHUB_ENV"
+            echo "❌ TC3 FAIL — Create with null Replicas failed (HTTP $HTTP)"
+            echo "TC3=FAIL (HTTP $HTTP)" >> "$GITHUB_ENV"; exit 1
           fi
 
       # ── TC4: Compare null vs omit — should behave identically ─────────────
@@ -301,13 +298,14 @@ jobs:
 
           | TC | Endpoint | Payload | Expected | Result |
           |----|----------|---------|----------|--------|
-          | TC1 | \`ReplicationControllerChangeAll\` | \`Replicas: null\` | Replicas unchanged (stay 2) | $(result "${TC1:-}") |
-          | TC2 | \`ReplicationControllerBulkChangeAll\` | \`Replicas: null\` | Replicas unchanged (stay 2) | $(result "${TC2:-}") |
-          | TC3 | \`ReplicationControllerUpdate\` (create) | \`Replicas: null\` | Default or error | $(result "${TC3:-}") |
-          | TC4 | \`ReplicationControllerChangeAll\` | null vs omit | Identical behavior | $(result "${TC4:-}") |
+          | TC1 | \`ReplicationControllerChangeAll\` | \`Replicas: null\` | HTTP 400 — rejected, replicas unchanged | $(result "${TC1:-}") |
+          | TC2 | \`ReplicationControllerBulkChangeAll\` | \`Replicas: null\` | HTTP 400 — rejected, replicas unchanged | $(result "${TC2:-}") |
+          | TC3 | \`ReplicationControllerUpdate\` (create) | \`Replicas: null\` | Creates with Replicas=0 (existing behaviour) | $(result "${TC3:-}") |
+          | TC4 | \`ReplicationControllerChangeAll\` | null vs omit | Both leave replicas unchanged | $(result "${TC4:-}") |
 
-          ### Key distinction
-          - \`Replicas: 0\` → intentionally stop the service ✅ (PR fix)
-          - \`Replicas: null\` → should be treated same as omitting the field (no change)
-          - Omitting \`Replicas\` → no change to current count
+          ### Expected behaviour (confirmed)
+          - \`Replicas: null\` on **update** → HTTP 400, service not changed ✅
+          - \`Replicas: null\` on **create** → service created with Replicas=0 ✅ (existing behaviour, same as integer default)
+          - \`Replicas: 0\` on update → intentionally stops the service ✅ (PR fix)
+          - Omitting \`Replicas\` → no change to current count ✅
           EOF
