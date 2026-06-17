@@ -1,0 +1,523 @@
+name: DUPLO-11210 — Full Regression Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "DuploCloud portal URL"
+        required: true
+        default: "https://oneclick.duplocloud.net"
+      tenant_name:
+        description: "Tenant name"
+        required: true
+        default: "maja1706"
+      service_prefix:
+        description: "Prefix for all test service names"
+        required: false
+        default: "regr"
+      bulk_count:
+        description: "Number of services for bulk test (max 10)"
+        required: false
+        default: "5"
+      image:
+        description: "Container image"
+        required: false
+        default: "nginx:latest"
+
+env:
+  DUPLO_HOST: ${{ github.event.inputs.host }}
+  DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+  TENANT_NAME: ${{ github.event.inputs.tenant_name }}
+  IMAGE: ${{ github.event.inputs.image }}
+  PREFIX: ${{ github.event.inputs.service_prefix }}
+  BULK_COUNT: ${{ github.event.inputs.bulk_count }}
+
+jobs:
+  full-regression:
+    name: DUPLO-11210 Full Regression (${{ github.event.inputs.service_prefix }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Auth + tenant resolution ──────────────────────────────────────────
+      - name: Validate token and resolve tenant ID
+        id: tenant
+        run: |
+          if [ -z "$DUPLO_TOKEN" ]; then
+            echo "❌ DUPLO_TOKEN secret is not set."; exit 1
+          fi
+          HTTP=$(curl -s -o /tmp/tenants.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/v3/admin/tenant")
+          if [ "$HTTP" = "401" ]; then
+            echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."; exit 1
+          elif [ "$HTTP" != "200" ]; then
+            echo "❌ Unexpected HTTP $HTTP"; cat /tmp/tenants.json; exit 1
+          fi
+          TENANT_ID=$(python3 - <<'PY'
+          import json, sys, os
+          tenant = os.environ["TENANT_NAME"].lower()
+          data = json.load(open("/tmp/tenants.json"))
+          for t in data:
+              if t.get("AccountName", "").lower() == tenant:
+                  print(t["TenantId"]); sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr); sys.exit(1)
+          PY
+          )
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
+
+      # ── Create all test services ──────────────────────────────────────────
+      - name: Create test services
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          create_svc() {
+            local name=$1 replicas=$2 extra=${3:-}
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+              -d "{\"Name\":\"${name}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":${replicas},\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"${extra}}")
+            echo "  $name (Replicas=${replicas}) → HTTP $HTTP"
+          }
+
+          echo "Creating static deployment..."
+          create_svc "${PREFIX}-static" 1
+
+          echo "Creating statefulset..."
+          create_svc "${PREFIX}-stateful" 1 ",\"IsStatefulSet\":true"
+
+          echo "Creating ${BULK_COUNT} bulk services..."
+          for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
+            create_svc "${PREFIX}-bulk-${i}" 1
+          done
+
+          echo "Waiting 15s for services to initialize..."
+          sleep 15
+
+      # ── TC1: Static — Scale running service 1→0 ──────────────────────────
+      - name: "TC1 — Static: Scale running service 1→0"
+        id: tc1
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-static"
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"}"
+
+          R=""; for attempt in $(seq 1 12); do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            [ "$R" = "0" ] && break
+            echo "  Attempt $attempt/12 — Replicas=$R, waiting 5s..."; sleep 5
+          done
+
+          if [ "$R" = "0" ]; then
+            echo "✅ TC1 PASS — $SVC at Replicas=0"
+            echo "TC1=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC1 FAIL — Expected 0, got '$R'"
+            echo "TC1=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC2: Static — Scale stopped service 0→1 ──────────────────────────
+      - name: "TC2 — Static: Scale stopped service 0→1"
+        id: tc2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-static"
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}"
+
+          R=""; for attempt in $(seq 1 12); do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            [ "$R" = "1" ] && break
+            echo "  Attempt $attempt/12 — Replicas=$R, waiting 5s..."; sleep 5
+          done
+
+          if [ "$R" = "1" ]; then
+            echo "✅ TC2 PASS — $SVC at Replicas=1"
+            echo "TC2=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC2 FAIL — Expected 1, got '$R'"
+            echo "TC2=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC3: Static — Update service image when running (replicas must stay 1) ──
+      - name: "TC3 — Static: Update image when running — Replicas must stay 1"
+        id: tc3
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-static"
+          echo "Updating image of $SVC (no Replicas field) while at 1..."
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE}\",\"TenantId\":\"${TENANT_ID}\"}"
+          sleep 10
+
+          R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+
+          if [ "$R" = "1" ]; then
+            echo "✅ TC3 PASS — Replicas still 1 after image update"
+            echo "TC3=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC3 FAIL — Expected 1, got '$R' (update accidentally changed replicas)"
+            echo "TC3=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC4: Static — Update service image when stopped (replicas must stay 0) ──
+      - name: "TC4 — Static: Update image when stopped — Replicas must stay 0"
+        id: tc4
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-static"
+          # Scale to 0 first
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"}"
+
+          for attempt in $(seq 1 12); do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            [ "$R" = "0" ] && break
+            echo "  Waiting for Replicas=0 (attempt $attempt/12)..."; sleep 5
+          done
+
+          echo "Updating image of $SVC (no Replicas field) while stopped at 0..."
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE}\",\"TenantId\":\"${TENANT_ID}\"}"
+          sleep 10
+
+          R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+
+          if [ "$R" = "0" ]; then
+            echo "✅ TC4 PASS — Replicas still 0 after image update on stopped service"
+            echo "TC4=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC4 FAIL — Expected 0, got '$R' (update accidentally changed replicas)"
+            echo "TC4=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC5: Create new service with Replicas=0 from the start ───────────
+      - name: "TC5 — Create service with Replicas=0 (started stopped)"
+        id: tc5
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-zero-create"
+          echo "Creating $SVC with Replicas=0..."
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+            -d "{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":0,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}")
+          echo "  Create HTTP: $HTTP"
+
+          if [ "$HTTP" != "200" ]; then
+            echo "❌ TC5 FAIL — API rejected Replicas=0 on create (HTTP $HTTP)"
+            echo "TC5=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+          R=""; for attempt in $(seq 1 6); do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            [ -n "$R" ] && break
+            echo "  Attempt $attempt/6 — service not visible yet, waiting 5s..."; sleep 5
+          done
+
+          if [ "$R" = "0" ]; then
+            echo "✅ TC5 PASS — $SVC created with Replicas=0"
+            echo "TC5=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC5 FAIL — Expected 0, got '$R'"
+            echo "TC5=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC6: Stability — stopped services must not auto-start (2 min) ────
+      - name: "TC6 — Stability: Wait 2 min — stopped services must not auto-start"
+        id: tc6
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          echo "⏳ Waiting 2 minutes (checking ${PREFIX}-static and ${PREFIX}-zero-create)..."
+          for i in $(seq 120 -10 10); do echo "  $i seconds remaining..."; sleep 10; done
+          echo "✅ Wait complete."
+
+          PASS=0; FAIL=0
+          for SVC in "${PREFIX}-static" "${PREFIX}-zero-create"; do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            if [ "$R" = "0" ]; then
+              echo "  ✅ $SVC: still Replicas=0 (not auto-started)"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $SVC: auto-started to Replicas=$R — unexpected!"
+              FAIL=$((FAIL+1))
+            fi
+          done
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "TC6=PASS" >> "$GITHUB_ENV"
+          else
+            echo "TC6=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC7: Bulk — BulkChangeAll N services 1→0 (single API call) ───────
+      - name: "TC7 — Bulk: BulkChangeAll ${{ github.event.inputs.bulk_count }} services 1→0"
+        id: tc7
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          PAYLOAD=$(python3 -c "
+          import json, os
+          count  = int(os.environ['BULK_COUNT'])
+          prefix = os.environ['PREFIX']
+          tid    = os.environ['TENANT_ID']
+          svcs   = [{'Name': f'{prefix}-bulk-{i:02d}', 'Replicas': 0, 'TenantId': tid} for i in range(1, count+1)]
+          print(json.dumps(svcs))
+          ")
+
+          echo "Sending BulkChangeAll for ${BULK_COUNT} services → 0"
+          HTTP=$(curl -s -o /tmp/bulk_tc7.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChangeAll" \
+            -d "$PAYLOAD")
+          echo "  HTTP: $HTTP"
+
+          for attempt in $(seq 1 12); do
+            NOT_READY=0
+            for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
+              R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+                "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+                python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${PREFIX}-bulk-${i}']" 2>/dev/null)
+              [ "$R" != "0" ] && NOT_READY=$((NOT_READY+1))
+            done
+            [ "$NOT_READY" -eq 0 ] && break
+            echo "  Attempt $attempt/12 — $NOT_READY not at 0, waiting 5s..."; sleep 5
+          done
+
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
+            NAME="${PREFIX}-bulk-${i}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            if [ "$R" = "0" ]; then echo "  ✅ $NAME: Replicas=0"; PASS=$((PASS+1))
+            else echo "  ❌ $NAME: Expected 0, got '$R'"; FAIL=$((FAIL+1)); fi
+          done
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "TC7=PASS (${PASS}/${BULK_COUNT})" >> "$GITHUB_ENV"
+          else
+            echo "TC7=FAIL (${PASS}/${BULK_COUNT} passed)" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC8: Bulk — BulkChange N services 0→1 (single API call) ──────────
+      - name: "TC8 — Bulk: BulkChange ${{ github.event.inputs.bulk_count }} services 0→1"
+        id: tc8
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          PAYLOAD=$(python3 -c "
+          import json, os
+          count  = int(os.environ['BULK_COUNT'])
+          prefix = os.environ['PREFIX']
+          tid    = os.environ['TENANT_ID']
+          svcs   = [{'Name': f'{prefix}-bulk-{i:02d}', 'Replicas': 1, 'TenantId': tid} for i in range(1, count+1)]
+          print(json.dumps(svcs))
+          ")
+
+          echo "Sending BulkChange for ${BULK_COUNT} services → 1"
+          HTTP=$(curl -s -o /tmp/bulk_tc8.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChange" \
+            -d "$PAYLOAD")
+          echo "  HTTP: $HTTP"
+
+          for attempt in $(seq 1 12); do
+            NOT_READY=0
+            for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
+              R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+                "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+                python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${PREFIX}-bulk-${i}']" 2>/dev/null)
+              [ "$R" != "1" ] && NOT_READY=$((NOT_READY+1))
+            done
+            [ "$NOT_READY" -eq 0 ] && break
+            echo "  Attempt $attempt/12 — $NOT_READY not at 1, waiting 5s..."; sleep 5
+          done
+
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
+            NAME="${PREFIX}-bulk-${i}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            if [ "$R" = "1" ]; then echo "  ✅ $NAME: Replicas=1"; PASS=$((PASS+1))
+            else echo "  ❌ $NAME: Expected 1, got '$R'"; FAIL=$((FAIL+1)); fi
+          done
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "TC8=PASS (${PASS}/${BULK_COUNT})" >> "$GITHUB_ENV"
+          else
+            echo "TC8=FAIL (${PASS}/${BULK_COUNT} passed)" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC9: StatefulSet — Scale running service 1→0 ─────────────────────
+      - name: "TC9 — StatefulSet: Scale running service 1→0"
+        id: tc9
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-stateful"
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"}"
+
+          R=""; for attempt in $(seq 1 12); do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            [ "$R" = "0" ] && break
+            echo "  Attempt $attempt/12 — Replicas=$R, waiting 5s..."; sleep 5
+          done
+
+          if [ "$R" = "0" ]; then
+            echo "✅ TC9 PASS — StatefulSet $SVC at Replicas=0"
+            echo "TC9=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC9 FAIL — Expected 0, got '$R'"
+            echo "TC9=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── TC10: StatefulSet — Scale stopped service 0→1 ────────────────────
+      - name: "TC10 — StatefulSet: Scale stopped service 0→1"
+        id: tc10
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          SVC="${PREFIX}-stateful"
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}"
+
+          R=""; for attempt in $(seq 1 12); do
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+            [ "$R" = "1" ] && break
+            echo "  Attempt $attempt/12 — Replicas=$R, waiting 5s..."; sleep 5
+          done
+
+          if [ "$R" = "1" ]; then
+            echo "✅ TC10 PASS — StatefulSet $SVC at Replicas=1"
+            echo "TC10=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TC10 FAIL — Expected 1, got '$R'"
+            echo "TC10=FAIL" >> "$GITHUB_ENV"; exit 1
+          fi
+
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Delete all test services (cleanup)
+        if: always()
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          echo "Deleting all test services..."
+          for SVC in "${PREFIX}-static" "${PREFIX}-zero-create" "${PREFIX}-stateful"; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
+            [ "$HTTP" = "200" ] && echo "  🗑️  Deleted $SVC" || echo "  ⚠️  $SVC → HTTP $HTTP"
+          done
+          for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
+            SVC="${PREFIX}-bulk-${i}"
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
+            [ "$HTTP" = "200" ] && echo "  🗑️  Deleted $SVC" || echo "  ⚠️  $SVC → HTTP $HTTP"
+          done
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          result() {
+            case "$1" in
+              PASS*) echo "✅ $1" ;;
+              FAIL*) echo "❌ $1" ;;
+              *)     echo "⏭️  SKIP" ;;
+            esac
+          }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## DUPLO-11210 — Full Regression Results
+
+          **Host:** ${{ github.event.inputs.host }}
+          **Tenant:** ${{ github.event.inputs.tenant_name }}
+          **Feature flag:** \`EnableDuploServiceScalingToZero\`
+
+          ### Automated Tests
+
+          | TC | Description | Category | Result |
+          |----|-------------|----------|--------|
+          | TC1 | Scale running static service 1→0 | Static | $(result "${TC1:-}") |
+          | TC2 | Scale stopped static service 0→1 | Static | $(result "${TC2:-}") |
+          | TC3 | Update image when running — Replicas stays 1 | Static | $(result "${TC3:-}") |
+          | TC4 | Update image when stopped — Replicas stays 0 | Static | $(result "${TC4:-}") |
+          | TC5 | Create service with Replicas=0 from start | Static | $(result "${TC5:-}") |
+          | TC6 | Stability: 2 min — stopped services don't auto-start | Static | $(result "${TC6:-}") |
+          | TC7 | Bulk BulkChangeAll ${{ github.event.inputs.bulk_count }} services 1→0 (single API call) | Bulk | $(result "${TC7:-}") |
+          | TC8 | Bulk BulkChange ${{ github.event.inputs.bulk_count }} services 0→1 (single API call) | Bulk | $(result "${TC8:-}") |
+          | TC9 | StatefulSet: scale running service 1→0 | StatefulSet | $(result "${TC9:-}") |
+          | TC10 | StatefulSet: scale stopped service 0→1 | StatefulSet | $(result "${TC10:-}") |
+
+          ### Manual Test Cases (require UI / cluster setup)
+
+          | TC | Description | Notes |
+          |----|-------------|-------|
+          | M1 | Scale to 0 via Terraform (\`replicas = 1 -> 0\`) | Run \`tf apply\` and verify pod count |
+          | M2 | HPA enabled — must not allow Replicas=0 (minReplica ≥ 1) | Enable HPA on a service, attempt scale to 0 |
+          | M3 | Start/Stop button — replica count must not change | Use DuploCloud UI Start/Stop toggle |
+          | M4 | StatefulSet Start/Stop — replica count must not change | Same as M3 for a StatefulSet service |
+          | M5 | KEDA (staticKeda) — add \`duplocloud.net/external-scaling: true\`, scale manually via Lens, then change replicas in Duplo | Requires KEDA configured |
+          | M6 | KEDA + StatefulSet — same as M5 for StatefulSet | Requires KEDA + StatefulSet |
+          | M7 | StatefulSet with external-scaling: scale via Lens → verify Duplo honors count on restart, pods not all terminated at once | Requires Lens access |
+          | M8 | Rolling update for K8s services | Deploy new image, verify rolling update behavior |
+          EOF
