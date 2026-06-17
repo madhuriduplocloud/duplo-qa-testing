@@ -60,6 +60,7 @@ jobs:
           PY
           )
           echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
           echo "Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
 
       # ── Test Suite 1: All endpoints (Change, ChangeAll, BulkChange, BulkChangeAll) ──
@@ -245,19 +246,17 @@ jobs:
       # ── Cleanup ──────────────────────────────────────────────────────────────────
       - name: Delete test services (cleanup)
         if: always()
-        env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          echo "Deleting test services created by Suite 1..."
+          echo "Deleting test services created by Suite 1 (TENANT_ID=${TENANT_ID})..."
           for NAME in test-scaling-zero test-scaling-zero-2; do
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $DUPLO_TOKEN" \
               -H "Content-Type: application/json" \
               -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${NAME}")
-            if [ "$HTTP" = "200" ]; then
-              echo "  🗑️  Deleted $NAME"
+            if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
+              echo "  🗑️  Deleted $NAME (HTTP $HTTP)"
             else
-              echo "  ⚠️  $NAME → HTTP $HTTP (may not exist)"
+              echo "  ⚠️  $NAME → HTTP $HTTP"
             fi
           done
 

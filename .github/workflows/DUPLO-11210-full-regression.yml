@@ -67,6 +67,7 @@ jobs:
           PY
           )
           echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
           echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
 
       # ── Create all test services ──────────────────────────────────────────
@@ -454,16 +455,18 @@ jobs:
       # ── Cleanup ───────────────────────────────────────────────────────────
       - name: Delete all test services (cleanup)
         if: always()
-        env:
-          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          echo "Deleting all test services..."
+          echo "Deleting all test services (TENANT_ID=${TENANT_ID})..."
           for SVC in "${PREFIX}-static" "${PREFIX}-zero-create" "${PREFIX}-stateful"; do
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $DUPLO_TOKEN" \
               -H "Content-Type: application/json" \
               -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
-            [ "$HTTP" = "200" ] && echo "  🗑️  Deleted $SVC" || echo "  ⚠️  $SVC → HTTP $HTTP"
+            if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
+              echo "  🗑️  Deleted $SVC (HTTP $HTTP)"
+            else
+              echo "  ⚠️  $SVC → HTTP $HTTP"
+            fi
           done
           for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
             SVC="${PREFIX}-bulk-${i}"
@@ -471,7 +474,11 @@ jobs:
               -H "Authorization: Bearer $DUPLO_TOKEN" \
               -H "Content-Type: application/json" \
               -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
-            [ "$HTTP" = "200" ] && echo "  🗑️  Deleted $SVC" || echo "  ⚠️  $SVC → HTTP $HTTP"
+            if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
+              echo "  🗑️  Deleted $SVC (HTTP $HTTP)"
+            else
+              echo "  ⚠️  $SVC → HTTP $HTTP"
+            fi
           done
 
       # ── Summary ───────────────────────────────────────────────────────────
