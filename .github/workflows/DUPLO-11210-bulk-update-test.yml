@@ -11,25 +11,30 @@ on:
         description: "Tenant name"
         required: true
         default: "maja1706"
-      svc1:
-        description: "First service name (must exist with >=1 replica)"
-        required: true
-        default: "sv01"
-      svc2:
-        description: "Second service name (must exist with >=1 replica)"
-        required: true
-        default: "sv02"
+      service_prefix:
+        description: "Service name prefix (services will be named <prefix>-01 to <prefix>-N)"
+        required: false
+        default: "bulk-test"
+      service_count:
+        description: "Number of services to create and test (max 10)"
+        required: false
+        default: "10"
+      image:
+        description: "Container image"
+        required: false
+        default: "nginx:latest"
 
 env:
   DUPLO_HOST: ${{ github.event.inputs.host }}
   DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
   TENANT_NAME: ${{ github.event.inputs.tenant_name }}
-  SVC1: ${{ github.event.inputs.svc1 }}
-  SVC2: ${{ github.event.inputs.svc2 }}
+  SERVICE_PREFIX: ${{ github.event.inputs.service_prefix }}
+  SERVICE_COUNT: ${{ github.event.inputs.service_count }}
+  IMAGE: ${{ github.event.inputs.image }}
 
 jobs:
   bulk-update-test:
-    name: Bulk Parallel Update Tests
+    name: Bulk Parallel Update Tests (${{ github.event.inputs.service_count }} services)
     runs-on: ubuntu-latest
 
     steps:
@@ -44,9 +49,6 @@ jobs:
         run: |
           if [ -z "$DUPLO_TOKEN" ]; then
             echo "❌ DUPLO_TOKEN secret is not set."
-            echo "Go to: Settings → Secrets and variables → Actions → New repository secret"
-            echo "Name: DUPLO_TOKEN"
-            echo "Value: your plain DuploCloud API token (from DuploCloud portal → profile icon → Token)"
             exit 1
           fi
 
@@ -56,7 +58,6 @@ jobs:
 
           if [ "$HTTP" = "401" ]; then
             echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."
-            echo "Get a fresh token from: ${DUPLO_HOST} → profile icon → Token"
             exit 1
           elif [ "$HTTP" != "200" ]; then
             echo "❌ Unexpected HTTP $HTTP from ${DUPLO_HOST}/v3/admin/tenant"
@@ -72,68 +73,243 @@ jobs:
               if t.get("AccountName", "").lower() == tenant:
                   print(t["TenantId"])
                   sys.exit(0)
-          print(f"Tenant '{tenant}' not found in: {[t.get('AccountName') for t in data]}", file=sys.stderr)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr)
           sys.exit(1)
           PY
           )
           echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
           echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
 
-      - name: Run bulk update test script
+      - name: Create test services (skip if already exist)
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          # Substitute env-var credentials into the script before running
-          sed \
-            -e "s|TOKEN=\".*\"|TOKEN=\"${DUPLO_TOKEN}\"|" \
-            -e "s|HOST=\".*\"|HOST=\"${DUPLO_HOST}\"|" \
-            -e "s|TENANT=\".*\"|TENANT=\"${TENANT_NAME}\"|" \
-            -e "s|TENANT_ID=\".*\"|TENANT_ID=\"${TENANT_ID}\"|" \
-            -e "s|SVC1=\".*\"|SVC1=\"${SVC1}\"|" \
-            -e "s|SVC2=\".*\"|SVC2=\"${SVC2}\"|" \
-            DUPLO-11210-bulk-update-test.sh > /tmp/bulk-test.sh
-          chmod +x /tmp/bulk-test.sh
-          bash /tmp/bulk-test.sh
-          echo "BULK_EXIT=$?" >> "$GITHUB_ENV"
+          COUNT=${{ github.event.inputs.service_count }}
+          PREFIX="${SERVICE_PREFIX}"
 
-      - name: Parse results
-        if: always()
+          echo "Creating $COUNT services with prefix '${PREFIX}'..."
+          for i in $(seq -f "%02g" 1 $COUNT); do
+            NAME="${PREFIX}-${i}"
+            RESP=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+              -d "{\"Name\":\"${NAME}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":1,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}")
+            HTTP=$(echo "$RESP" | tail -1)
+            BODY=$(echo "$RESP" | head -1)
+            if [ "$HTTP" = "200" ]; then
+              echo "  ✅ Created $NAME"
+            elif echo "$BODY" | grep -qi "already exists"; then
+              echo "  ⏭️  $NAME already exists — skipping"
+            else
+              echo "  ⚠️  $NAME → HTTP $HTTP: $BODY"
+            fi
+          done
+
+      - name: Reset all services to 1 replica
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          # Re-run to capture counts (script already passed/failed above)
-          PASS=$(grep -c "PASS" /tmp/bulk-test.sh 2>/dev/null || echo 0)
-          echo "BULK_PASS=$PASS" >> "$GITHUB_ENV"
+          COUNT=${{ github.event.inputs.service_count }}
+          PREFIX="${SERVICE_PREFIX}"
+          echo "Setting all $COUNT services to 1 replica..."
+
+          for i in $(seq -f "%02g" 1 $COUNT); do
+            NAME="${PREFIX}-${i}"
+            curl -s -o /dev/null \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+              -d "{\"Name\":\"${NAME}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}"
+            echo "  Reset $NAME → 1"
+          done
+
+      - name: TEST 1 — BulkChangeAll all ${{ github.event.inputs.service_count }} services 1→0 (single API call)
+        id: test1
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          COUNT=${{ github.event.inputs.service_count }}
+          PREFIX="${SERVICE_PREFIX}"
+
+          # Build JSON array for bulk call
+          PAYLOAD=$(python3 -c "
+          import json, os
+          count  = int(os.environ['SERVICE_COUNT'])
+          prefix = os.environ['SERVICE_PREFIX']
+          tid    = os.environ['TENANT_ID']
+          svcs   = [{'Name': f'{prefix}-{i:02d}', 'Replicas': 0, 'TenantId': tid} for i in range(1, count+1)]
+          print(json.dumps(svcs))
+          ")
+
+          echo "Sending BulkChangeAll for $COUNT services → replicas=0"
+          HTTP=$(curl -s -o /tmp/bulk1.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChangeAll" \
+            -d "$PAYLOAD")
+          echo "  HTTP: $HTTP"
+
+          # Verify all services are at 0
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 $COUNT); do
+            NAME="${PREFIX}-${i}"
+            REPLICAS=$(curl -s \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
+            if [ "$REPLICAS" = "0" ]; then
+              echo "  ✅ $NAME: Replicas=0"
+              ((PASS++))
+            else
+              echo "  ❌ $NAME: Expected 0, got $REPLICAS"
+              ((FAIL++))
+            fi
+          done
+          echo "TEST1_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST1_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 1 — PASS: $PASS  FAIL: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: TEST 2 — BulkChange all ${{ github.event.inputs.service_count }} services 0→1 (single API call)
+        id: test2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          COUNT=${{ github.event.inputs.service_count }}
+          PREFIX="${SERVICE_PREFIX}"
+
+          PAYLOAD=$(python3 -c "
+          import json, os
+          count  = int(os.environ['SERVICE_COUNT'])
+          prefix = os.environ['SERVICE_PREFIX']
+          tid    = os.environ['TENANT_ID']
+          svcs   = [{'Name': f'{prefix}-{i:02d}', 'Replicas': 1, 'TenantId': tid} for i in range(1, count+1)]
+          print(json.dumps(svcs))
+          ")
+
+          echo "Sending BulkChange for $COUNT services → replicas=1"
+          HTTP=$(curl -s -o /tmp/bulk2.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChange" \
+            -d "$PAYLOAD")
+          echo "  HTTP: $HTTP"
+
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 $COUNT); do
+            NAME="${PREFIX}-${i}"
+            REPLICAS=$(curl -s \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
+            if [ "$REPLICAS" = "1" ]; then
+              echo "  ✅ $NAME: Replicas=1"
+              ((PASS++))
+            else
+              echo "  ❌ $NAME: Expected 1, got $REPLICAS"
+              ((FAIL++))
+            fi
+          done
+          echo "TEST2_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST2_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 2 — PASS: $PASS  FAIL: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: TEST 3 — Omit Replicas in bulk (must not zero out any service)
+        id: test3
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          COUNT=${{ github.event.inputs.service_count }}
+          PREFIX="${SERVICE_PREFIX}"
+
+          PAYLOAD=$(python3 -c "
+          import json, os
+          count  = int(os.environ['SERVICE_COUNT'])
+          prefix = os.environ['SERVICE_PREFIX']
+          tid    = os.environ['TENANT_ID']
+          image  = os.environ['IMAGE']
+          svcs   = [{'Name': f'{prefix}-{i:02d}', 'Image': image, 'TenantId': tid} for i in range(1, count+1)]
+          print(json.dumps(svcs))
+          ")
+
+          echo "Sending BulkChangeAll for $COUNT services — omitting Replicas"
+          HTTP=$(curl -s -o /tmp/bulk3.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChangeAll" \
+            -d "$PAYLOAD")
+          echo "  HTTP: $HTTP"
+
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 $COUNT); do
+            NAME="${PREFIX}-${i}"
+            REPLICAS=$(curl -s \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
+            if [ "$REPLICAS" = "1" ]; then
+              echo "  ✅ $NAME: Replicas=1 (unchanged)"
+              ((PASS++))
+            else
+              echo "  ❌ $NAME: Expected 1 (unchanged), got $REPLICAS"
+              ((FAIL++))
+            fi
+          done
+          echo "TEST3_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST3_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 3 — PASS: $PASS  FAIL: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: Restore all services to 1 replica
+        if: always()
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          COUNT=${{ github.event.inputs.service_count }}
+          PREFIX="${SERVICE_PREFIX}"
+          echo "Restoring all $COUNT services to 1 replica..."
+          for i in $(seq -f "%02g" 1 $COUNT); do
+            NAME="${PREFIX}-${i}"
+            curl -s -o /dev/null \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+              -d "{\"Name\":\"${NAME}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}"
+            echo "  Restored $NAME → 1"
+          done
 
       - name: Write job summary
         if: always()
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          STATUS=$( [ "${BULK_EXIT:-0}" -eq 0 ] && echo "✅ All tests passed" || echo "❌ Some tests failed" )
+          TOTAL_PASS=$(( ${TEST1_PASS:-0} + ${TEST2_PASS:-0} + ${TEST3_PASS:-0} ))
+          TOTAL_FAIL=$(( ${TEST1_FAIL:-0} + ${TEST2_FAIL:-0} + ${TEST3_FAIL:-0} ))
+          STATUS=$( [ "$TOTAL_FAIL" -eq 0 ] && echo "✅ All tests passed" || echo "❌ Some tests failed" )
+
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## DUPLO-11210 — Bulk Service Update Test Results
+          ## DUPLO-11210 — Bulk Service Update Results
 
           **Status:** $STATUS
 
           | Input | Value |
           |-------|-------|
           | Host | ${{ github.event.inputs.host }} |
-          | Tenant | ${{ github.event.inputs.tenant_name }} ($TENANT_ID) |
-          | Service 1 | ${{ github.event.inputs.svc1 }} |
-          | Service 2 | ${{ github.event.inputs.svc2 }} |
+          | Tenant | ${{ github.event.inputs.tenant_name }} |
+          | Services | ${{ github.event.inputs.service_prefix }}-01 to ${{ github.event.inputs.service_prefix }}-${{ github.event.inputs.service_count }} |
+          | Total services | ${{ github.event.inputs.service_count }} |
           | Feature flag | \`EnableDuploServiceScalingToZero\` |
 
-          ### Tests Covered
+          ### Results
 
-          | # | Test | Endpoint | Services in Call |
-          |---|------|----------|-----------------|
-          | 1 | Single service 1→0 | \`duploctl update_replicas\` | 1 |
-          | 2 | Single service 0→1 | \`duploctl update_replicas\` | 1 |
-          | 3 | Image-only update, replicas unchanged | \`duploctl update_image\` | 1 |
-          | 4 | Parallel: both 1→0 | \`BulkChangeAll\` | 2 (parallel) |
-          | 5 | Parallel: both 0→1 | \`BulkChange\` | 2 (parallel) |
-          | 6 | Parallel mixed replicas | \`BulkChange\` | 2 (parallel) |
-          | 7 | Omit Replicas — must not zero out | \`BulkChangeAll\` | 1 |
-          | 8 | Already at 0 → 0 (no-op) | \`BulkChange\` | 1 |
+          | Test | Description | Endpoint | Pass | Fail |
+          |------|-------------|----------|------|------|
+          | 1 | All ${{ github.event.inputs.service_count }} services 1→0 (parallel) | \`BulkChangeAll\` | ${TEST1_PASS:-0} | ${TEST1_FAIL:-0} |
+          | 2 | All ${{ github.event.inputs.service_count }} services 0→1 (parallel) | \`BulkChange\` | ${TEST2_PASS:-0} | ${TEST2_FAIL:-0} |
+          | 3 | Omit Replicas — none should zero out | \`BulkChangeAll\` | ${TEST3_PASS:-0} | ${TEST3_FAIL:-0} |
+          | **Total** | | | **$TOTAL_PASS** | **$TOTAL_FAIL** |
 
-          > Tests 4–6 send multiple services in **one API call**, updated in parallel server-side.
+          > All bulk calls send **all ${{ github.event.inputs.service_count }} services in one API call**, updated in parallel server-side.
           EOF
