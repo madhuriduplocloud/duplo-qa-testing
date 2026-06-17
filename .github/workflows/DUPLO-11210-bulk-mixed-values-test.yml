@@ -1,0 +1,235 @@
+name: DUPLO-11210 — Bulk Mixed Replica Values Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "DuploCloud portal URL"
+        required: true
+        default: "https://oneclick.duplocloud.net"
+      tenant_name:
+        description: "Tenant name"
+        required: true
+        default: "maja1706"
+      service_prefix:
+        description: "Test service name prefix"
+        required: false
+        default: "mixed-svc"
+      image:
+        description: "Container image"
+        required: false
+        default: "nginx:latest"
+
+# Tests ReplicationControllerBulkChangeAll and ReplicationControllerBulkChange
+# with different replica counts for different services in the same single API call.
+#
+# Local test results (2026-06-17):
+#   BulkChangeAll with mixed values: BUG — only scale-to-0 applied, non-zero changes silently ignored
+#   BulkChange    with mixed values: PASS — all replica counts correctly applied
+
+env:
+  DUPLO_HOST: ${{ github.event.inputs.host }}
+  DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+  TENANT_NAME: ${{ github.event.inputs.tenant_name }}
+  PREFIX: ${{ github.event.inputs.service_prefix }}
+  IMAGE: ${{ github.event.inputs.image }}
+
+jobs:
+  bulk-mixed-values-test:
+    name: Bulk Mixed Replica Values (${{ github.event.inputs.service_prefix }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate token and resolve tenant ID
+        id: tenant
+        run: |
+          if [ -z "$DUPLO_TOKEN" ]; then
+            echo "❌ DUPLO_TOKEN secret is not set."; exit 1
+          fi
+          HTTP=$(curl -s -o /tmp/tenants.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/v3/admin/tenant")
+          if [ "$HTTP" = "401" ]; then
+            echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."; exit 1
+          elif [ "$HTTP" != "200" ]; then
+            echo "❌ Unexpected HTTP $HTTP"; cat /tmp/tenants.json; exit 1
+          fi
+          TENANT_ID=$(python3 - <<'PY'
+          import json, sys, os
+          tenant = os.environ["TENANT_NAME"].lower()
+          data = json.load(open("/tmp/tenants.json"))
+          for t in data:
+              if t.get("AccountName", "").lower() == tenant:
+                  print(t["TenantId"]); sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr); sys.exit(1)
+          PY
+          )
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
+          echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
+
+      - name: Create 3 test services at Replicas=2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          for i in 01 02 03; do
+            NAME="${PREFIX}-${i}"
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+              -d "{\"Name\":\"${NAME}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":2,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}")
+            echo "  $NAME → HTTP $HTTP"
+          done
+          echo "Waiting 15s for services to initialize..."
+          sleep 15
+
+          for i in 01 02 03; do
+            NAME="${PREFIX}-${i}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            echo "  $NAME: Replicas=$R"
+          done
+
+      # ── TC1: BulkChangeAll — mixed values ─────────────────────────────────
+      - name: "TC1 — BulkChangeAll: svc-01→0, svc-02→3, svc-03→1 (single API call)"
+        id: tc1
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          PAYLOAD="[
+            {\"Name\":\"${PREFIX}-01\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"},
+            {\"Name\":\"${PREFIX}-02\",\"Replicas\":3,\"TenantId\":\"${TENANT_ID}\"},
+            {\"Name\":\"${PREFIX}-03\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}
+          ]"
+          echo "Sending BulkChangeAll with mixed replica counts..."
+          HTTP=$(curl -s -o /tmp/tc1.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChangeAll" \
+            -d "$PAYLOAD")
+          echo "  HTTP: $HTTP  Body: $(cat /tmp/tc1.json)"
+          sleep 15
+
+          PASS=0; FAIL=0
+          declare -A EXPECTED=( ["${PREFIX}-01"]="0" ["${PREFIX}-02"]="3" ["${PREFIX}-03"]="1" )
+          for i in 01 02 03; do
+            NAME="${PREFIX}-${i}"
+            EXP="${EXPECTED[$NAME]}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            if [ "$R" = "$EXP" ]; then
+              echo "  ✅ $NAME: Replicas=$R (expected $EXP)"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $NAME: Expected $EXP, got $R"
+              FAIL=$((FAIL+1))
+            fi
+          done
+          echo "TC1_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TC1_FAIL=$FAIL" >> "$GITHUB_ENV"
+          if [ "$FAIL" -eq 0 ]; then
+            echo "TC1=PASS" >> "$GITHUB_ENV"
+          else
+            echo "TC1=FAIL ($FAIL/3 services wrong)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Reset all services to Replicas=2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          for i in 01 02 03; do
+            curl -s -o /dev/null \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+              -d "{\"Name\":\"${PREFIX}-${i}\",\"Replicas\":2,\"TenantId\":\"${TENANT_ID}\"}"
+          done
+          sleep 10
+
+      # ── TC2: BulkChange — same mixed values ───────────────────────────────
+      - name: "TC2 — BulkChange: svc-01→0, svc-02→3, svc-03→1 (single API call)"
+        id: tc2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          PAYLOAD="[
+            {\"Name\":\"${PREFIX}-01\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"},
+            {\"Name\":\"${PREFIX}-02\",\"Replicas\":3,\"TenantId\":\"${TENANT_ID}\"},
+            {\"Name\":\"${PREFIX}-03\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}
+          ]"
+          echo "Sending BulkChange with mixed replica counts..."
+          HTTP=$(curl -s -o /tmp/tc2.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChange" \
+            -d "$PAYLOAD")
+          echo "  HTTP: $HTTP  Body: $(cat /tmp/tc2.json)"
+          sleep 15
+
+          PASS=0; FAIL=0
+          declare -A EXPECTED=( ["${PREFIX}-01"]="0" ["${PREFIX}-02"]="3" ["${PREFIX}-03"]="1" )
+          for i in 01 02 03; do
+            NAME="${PREFIX}-${i}"
+            EXP="${EXPECTED[$NAME]}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            if [ "$R" = "$EXP" ]; then
+              echo "  ✅ $NAME: Replicas=$R (expected $EXP)"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $NAME: Expected $EXP, got $R"
+              FAIL=$((FAIL+1))
+            fi
+          done
+          echo "TC2_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TC2_FAIL=$FAIL" >> "$GITHUB_ENV"
+          if [ "$FAIL" -eq 0 ]; then
+            echo "TC2=PASS" >> "$GITHUB_ENV"
+          else
+            echo "TC2=FAIL ($FAIL/3 services wrong)" >> "$GITHUB_ENV"
+          fi
+
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Delete test services (cleanup)
+        if: always()
+        run: |
+          pip install -q duplocloud-client
+          DC="duploctl --host $DUPLO_HOST --token $DUPLO_TOKEN --tenant $TENANT_NAME"
+          for i in 01 02 03; do
+            SVC="${PREFIX}-${i}"
+            if $DC service delete "$SVC" > /dev/null 2>&1; then
+              echo "  🗑️  Deleted $SVC"
+            else
+              echo "  ⚠️  Could not delete $SVC"
+            fi
+          done
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          result() { case "$1" in PASS*) echo "✅ $1";; FAIL*) echo "❌ $1";; *) echo "⏭️  SKIP";; esac; }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## DUPLO-11210 — Bulk Mixed Replica Values Test Results
+
+          **Host:** ${{ github.event.inputs.host }}
+          **Tenant:** ${{ github.event.inputs.tenant_name }}
+          **Services:** ${PREFIX}-01 (→0), ${PREFIX}-02 (→3), ${PREFIX}-03 (→1) in one API call
+
+          | TC | Endpoint | svc-01→0 | svc-02→3 | svc-03→1 | Result |
+          |----|----------|----------|----------|----------|--------|
+          | TC1 | \`ReplicationControllerBulkChangeAll\` | ${TC1_PASS:-?}/3 | | | $(result "${TC1:-}") |
+          | TC2 | \`ReplicationControllerBulkChange\` | ${TC2_PASS:-?}/3 | | | $(result "${TC2:-}") |
+
+          > **Known finding (local test 2026-06-17):** \`BulkChangeAll\` with mixed values only
+          > applied the scale-to-0 entry; non-zero replica changes were silently ignored.
+          > \`BulkChange\` applied all mixed values correctly.
+          EOF
