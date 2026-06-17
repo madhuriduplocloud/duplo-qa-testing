@@ -68,14 +68,16 @@ jobs:
           kubectl config set-credentials oneclick-user --token="$K8S_TOKEN"
 
           # Check cluster connectivity (cluster may have private endpoint)
-          if kubectl get nodes --no-headers 2>/dev/null | awk '{print $1, $2}'; then
+          # Use --request-timeout to fail fast; redirect all output to capture exit code only
+          if kubectl get nodes --no-headers --request-timeout=10s > /tmp/nodes.txt 2>&1; then
             echo "cluster_accessible=true" >> "$GITHUB_OUTPUT"
+            cat /tmp/nodes.txt | awk '{print $1, $2}'
             echo "✅ Cluster accessible via kubectl"
           else
             echo "cluster_accessible=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️  Cluster endpoint not reachable from this runner."
-            echo "   The oneclick EKS cluster has a private endpoint (no public DNS)."
-            echo "   kubectl steps will be skipped. Use a self-hosted runner inside the VPC to run them."
+            echo "⚠️  Cluster endpoint not reachable from this runner ($(cat /tmp/nodes.txt | tail -1))."
+            echo "   The oneclick EKS cluster has a private-only endpoint (NXDOMAIN from public DNS)."
+            echo "   kubectl steps will be skipped — use a self-hosted runner inside the AWS VPC."
           fi
 
       - name: Install KEDA if not present
