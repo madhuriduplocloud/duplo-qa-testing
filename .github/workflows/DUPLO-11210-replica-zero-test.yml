@@ -242,6 +242,25 @@ jobs:
           echo "SUITE2_FAIL=$FAIL" >> "$GITHUB_ENV"
           [ "$FAIL" -eq 0 ] || exit 1
 
+      # ── Cleanup ──────────────────────────────────────────────────────────────────
+      - name: Delete test services (cleanup)
+        if: always()
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          echo "Deleting test services created by Suite 1..."
+          for NAME in test-scaling-zero test-scaling-zero-2; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${NAME}")
+            if [ "$HTTP" = "200" ]; then
+              echo "  🗑️  Deleted $NAME"
+            else
+              echo "  ⚠️  $NAME → HTTP $HTTP (may not exist)"
+            fi
+          done
+
       # ── Summary ──────────────────────────────────────────────────────────────────
       - name: Write job summary
         if: always()
