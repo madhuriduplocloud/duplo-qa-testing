@@ -150,6 +150,22 @@ jobs:
             -d "$PAYLOAD")
           echo "  HTTP: $HTTP"
 
+          # Wait up to 60s for all services to reach 0
+          echo "  Waiting for services to reach 0 replicas..."
+          for attempt in $(seq 1 12); do
+            NOT_READY=0
+            for i in $(seq -f "%02g" 1 $COUNT); do
+              NAME="${SERVICE_PREFIX}-${i}"
+              R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+                "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+                python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+              [ "$R" != "0" ] && NOT_READY=$((NOT_READY+1))
+            done
+            [ "$NOT_READY" -eq 0 ] && break
+            echo "  Attempt $attempt/12 — $NOT_READY service(s) not yet at 0, waiting 5s..."
+            sleep 5
+          done
+
           # Verify all services are at 0
           PASS=0; FAIL=0
           for i in $(seq -f "%02g" 1 $COUNT); do
@@ -160,10 +176,10 @@ jobs:
               python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
             if [ "$REPLICAS" = "0" ]; then
               echo "  ✅ $NAME: Replicas=0"
-              ((PASS++))
+              PASS=$((PASS+1))
             else
               echo "  ❌ $NAME: Expected 0, got $REPLICAS"
-              ((FAIL++))
+              FAIL=$((FAIL+1))
             fi
           done
           echo "TEST1_PASS=$PASS" >> "$GITHUB_ENV"
@@ -195,10 +211,10 @@ jobs:
               python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
             if [ "$REPLICAS" = "0" ]; then
               echo "  ✅ $NAME: still at Replicas=0 (not auto-recovered)"
-              ((PASS++))
+              PASS=$((PASS+1))
             else
               echo "  ❌ $NAME: Replicas auto-recovered to $REPLICAS — unexpected!"
-              ((FAIL++))
+              FAIL=$((FAIL+1))
             fi
           done
           echo "TEST1B_PASS=$PASS" >> "$GITHUB_ENV"
@@ -231,6 +247,22 @@ jobs:
             -d "$PAYLOAD")
           echo "  HTTP: $HTTP"
 
+          # Wait up to 60s for all services to reach 1
+          echo "  Waiting for services to reach 1 replica..."
+          for attempt in $(seq 1 12); do
+            NOT_READY=0
+            for i in $(seq -f "%02g" 1 $COUNT); do
+              NAME="${SERVICE_PREFIX}-${i}"
+              R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+                "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+                python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+              [ "$R" != "1" ] && NOT_READY=$((NOT_READY+1))
+            done
+            [ "$NOT_READY" -eq 0 ] && break
+            echo "  Attempt $attempt/12 — $NOT_READY service(s) not yet at 1, waiting 5s..."
+            sleep 5
+          done
+
           PASS=0; FAIL=0
           for i in $(seq -f "%02g" 1 $COUNT); do
             NAME="${PREFIX}-${i}"
@@ -240,10 +272,10 @@ jobs:
               python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
             if [ "$REPLICAS" = "1" ]; then
               echo "  ✅ $NAME: Replicas=1"
-              ((PASS++))
+              PASS=$((PASS+1))
             else
               echo "  ❌ $NAME: Expected 1, got $REPLICAS"
-              ((FAIL++))
+              FAIL=$((FAIL+1))
             fi
           done
           echo "TEST2_PASS=$PASS" >> "$GITHUB_ENV"
@@ -277,6 +309,9 @@ jobs:
             -d "$PAYLOAD")
           echo "  HTTP: $HTTP"
 
+          # Short wait for the update to propagate
+          sleep 10
+
           PASS=0; FAIL=0
           for i in $(seq -f "%02g" 1 $COUNT); do
             NAME="${PREFIX}-${i}"
@@ -286,10 +321,10 @@ jobs:
               python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']")
             if [ "$REPLICAS" = "1" ]; then
               echo "  ✅ $NAME: Replicas=1 (unchanged)"
-              ((PASS++))
+              PASS=$((PASS+1))
             else
               echo "  ❌ $NAME: Expected 1 (unchanged), got $REPLICAS"
-              ((FAIL++))
+              FAIL=$((FAIL+1))
             fi
           done
           echo "TEST3_PASS=$PASS" >> "$GITHUB_ENV"

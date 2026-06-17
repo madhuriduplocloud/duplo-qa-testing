@@ -107,10 +107,10 @@ jobs:
             read -r replicas prev <<< "$(get_replicas "$svc")"
             if [ "$replicas" -eq "$expected" ] 2>/dev/null; then
               echo "  ✅ PASS  $svc: Replicas=$replicas  ReplicasPrev=$prev"
-              ((PASS++))
+              PASS=$((PASS+1))
             else
               echo "  ❌ FAIL  $svc: Expected=$expected  Got=$replicas"
-              ((FAIL++))
+              FAIL=$((FAIL+1))
             fi
           }
 
@@ -197,10 +197,10 @@ jobs:
             local replicas; replicas=$(get_replicas "$svc")
             if [ "$replicas" -eq "$expected" ] 2>/dev/null; then
               echo "  ✅ PASS  $svc: Replicas=$replicas"
-              ((PASS++))
+              PASS=$((PASS+1))
             else
               echo "  ❌ FAIL  $svc: Expected=$expected  Got=$replicas"
-              ((FAIL++))
+              FAIL=$((FAIL+1))
             fi
           }
 
