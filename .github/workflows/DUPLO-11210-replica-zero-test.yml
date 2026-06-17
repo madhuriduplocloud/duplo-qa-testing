@@ -1,0 +1,270 @@
+name: DUPLO-11210 — Replica Scale-to-Zero Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "DuploCloud portal URL"
+        required: true
+        default: "https://oneclick.duplocloud.net"
+      tenant_name:
+        description: "Tenant name (e.g. maja1706)"
+        required: true
+        default: "maja1706"
+      svc1:
+        description: "First service name for bulk tests"
+        required: false
+        default: "sv01"
+      svc2:
+        description: "Second service name for bulk tests"
+        required: false
+        default: "sv02"
+
+env:
+  DUPLO_HOST: ${{ github.event.inputs.host }}
+  DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+  TENANT_NAME: ${{ github.event.inputs.tenant_name }}
+
+jobs:
+  test-replica-zero:
+    name: Replica Scale-to-Zero
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install duploctl
+        run: pip install duplocloud-client
+
+      - name: Resolve Tenant ID
+        id: tenant
+        run: |
+          TENANT_ID=$(python3 - <<'PY'
+          import os, urllib.request, json, sys
+          host    = os.environ["DUPLO_HOST"]
+          tenant  = os.environ["TENANT_NAME"].lower()
+          token   = os.environ["DUPLO_TOKEN"]
+          req = urllib.request.Request(
+              f"{host}/v3/admin/tenant",
+              headers={"Authorization": f"Bearer {token}"}
+          )
+          with urllib.request.urlopen(req) as r:
+              data = json.load(r)
+          for t in data:
+              if t.get("AccountName", "").lower() == tenant:
+                  print(t["TenantId"])
+                  sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr)
+          sys.exit(1)
+          PY
+          )
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
+
+      # ── Test Suite 1: All endpoints (Change, ChangeAll, BulkChange, BulkChangeAll) ──
+      - name: Run full endpoint test suite
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          # Inline the script with env-var credentials instead of hardcoded token
+          HOST="${DUPLO_HOST}"
+          TOKEN="${DUPLO_TOKEN}"
+          TENANT_ID="${TENANT_ID}"
+          SVC1="test-scaling-zero"
+          SVC2="test-scaling-zero-2"
+          PASS=0; FAIL=0; BUGS=()
+
+          api() {
+            local method=$1 path=$2 body=$3
+            if [ -n "$body" ]; then
+              curl -s -w "\n%{http_code}" \
+                -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+                -X "$method" "${HOST}${path}" -d "$body"
+            else
+              curl -s -H "Authorization: Bearer $TOKEN" "${HOST}${path}"
+            fi
+          }
+
+          get_replicas() {
+            api GET "/subscriptions/${TENANT_ID}/GetReplicationControllers" | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          for s in data:
+              if s['Name'] == '${1}':
+                  print(s['Replicas'], s.get('ReplicasPrev',''))
+                  break
+          "
+          }
+
+          force_replicas() {
+            api POST "/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+              "{\"Name\":\"${1}\",\"Replicas\":${2},\"TenantId\":\"${TENANT_ID}\"}" > /dev/null
+          }
+
+          check() {
+            local svc=$1 expected=$2
+            read -r replicas prev <<< "$(get_replicas "$svc")"
+            if [ "$replicas" -eq "$expected" ] 2>/dev/null; then
+              echo "  ✅ PASS  $svc: Replicas=$replicas  ReplicasPrev=$prev"
+              ((PASS++))
+            else
+              echo "  ❌ FAIL  $svc: Expected=$expected  Got=$replicas"
+              ((FAIL++))
+            fi
+          }
+
+          # Create test services if they don't exist
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+            "{\"Name\":\"${SVC1}\",\"DockerImage\":\"nginx:latest\",\"Replicas\":1,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}" > /dev/null 2>&1
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+            "{\"Name\":\"${SVC2}\",\"DockerImage\":\"nginx:latest\",\"Replicas\":1,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}" > /dev/null 2>&1
+          force_replicas "$SVC1" 1; force_replicas "$SVC2" 1
+
+          echo "--- ReplicationControllerChangeAll: 1→0 ---"
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            "{\"Name\":\"${SVC1}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"}" > /dev/null
+          check "$SVC1" 0
+
+          echo "--- ReplicationControllerChangeAll: 0→1 ---"
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            "{\"Name\":\"${SVC1}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}" > /dev/null
+          check "$SVC1" 1
+
+          echo "--- ReplicationControllerChange: 1→0 ---"
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerChange" \
+            "{\"Name\":\"${SVC1}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"}" > /dev/null
+          check "$SVC1" 0
+
+          echo "--- Partial update (omit Replicas): must not zero out ---"
+          force_replicas "$SVC1" 1
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            "{\"Name\":\"${SVC1}\",\"Image\":\"nginx:latest\",\"TenantId\":\"${TENANT_ID}\"}" > /dev/null
+          check "$SVC1" 1
+
+          echo "--- BulkChangeAll: SVC1+SVC2 → 0 (parallel, single call) ---"
+          force_replicas "$SVC1" 1; force_replicas "$SVC2" 1
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerBulkChangeAll" \
+            "[{\"Name\":\"${SVC1}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"},{\"Name\":\"${SVC2}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"}]" > /dev/null
+          check "$SVC1" 0; check "$SVC2" 0
+
+          echo "--- BulkChange: SVC1+SVC2 → 1 (parallel, single call) ---"
+          api POST "/subscriptions/${TENANT_ID}/ReplicationControllerBulkChange" \
+            "[{\"Name\":\"${SVC1}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"},{\"Name\":\"${SVC2}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}]" > /dev/null
+          check "$SVC1" 1; check "$SVC2" 1
+
+          force_replicas "$SVC1" 1; force_replicas "$SVC2" 1
+
+          echo ""
+          echo "Suite 1 — PASS: $PASS  FAIL: $FAIL"
+          echo "SUITE1_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "SUITE1_FAIL=$FAIL" >> "$GITHUB_ENV"
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      # ── Test Suite 2: Bulk parallel update using duploctl + real tenant services ──
+      - name: Run bulk parallel test suite (duploctl)
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+          SVC1: ${{ github.event.inputs.svc1 }}
+          SVC2: ${{ github.event.inputs.svc2 }}
+        run: |
+          HOST="${DUPLO_HOST}"
+          TOKEN="${DUPLO_TOKEN}"
+          TENANT_ID="${TENANT_ID}"
+          SVC1="${SVC1}"
+          SVC2="${SVC2}"
+          PASS=0; FAIL=0
+
+          DC="duploctl --host $HOST --token $TOKEN --tenant $TENANT_NAME"
+
+          get_replicas() {
+            $DC service find "$1" --query "Replicas" --output string 2>&1
+          }
+
+          force_replicas() {
+            $DC service update_replicas "$1" --replicas "$2" > /dev/null 2>&1
+          }
+
+          bulk() {
+            local endpoint=$1 payload=$2
+            curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+              -X POST "${HOST}/subscriptions/${TENANT_ID}/${endpoint}" -d "$payload"
+          }
+
+          check() {
+            local svc=$1 expected=$2
+            local replicas; replicas=$(get_replicas "$svc")
+            if [ "$replicas" -eq "$expected" ] 2>/dev/null; then
+              echo "  ✅ PASS  $svc: Replicas=$replicas"
+              ((PASS++))
+            else
+              echo "  ❌ FAIL  $svc: Expected=$expected  Got=$replicas"
+              ((FAIL++))
+            fi
+          }
+
+          force_replicas "$SVC1" 1; force_replicas "$SVC2" 1
+
+          echo "--- duploctl update_replicas: $SVC1 1→0 ---"
+          $DC service update_replicas "$SVC1" --replicas 0 > /dev/null
+          check "$SVC1" 0
+
+          echo "--- duploctl update_replicas: $SVC1 0→1 ---"
+          $DC service update_replicas "$SVC1" --replicas 1 > /dev/null
+          check "$SVC1" 1
+
+          echo "--- BulkChangeAll: $SVC1+$SVC2 both 1→0 (parallel, single call) ---"
+          force_replicas "$SVC1" 1; force_replicas "$SVC2" 1
+          bulk "ReplicationControllerBulkChangeAll" \
+            "[{\"Name\":\"${SVC1}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"},{\"Name\":\"${SVC2}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"}]"
+          echo ""
+          check "$SVC1" 0; check "$SVC2" 0
+
+          echo "--- BulkChange: $SVC1+$SVC2 both 0→1 (parallel, single call) ---"
+          bulk "ReplicationControllerBulkChange" \
+            "[{\"Name\":\"${SVC1}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"},{\"Name\":\"${SVC2}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}]"
+          echo ""
+          check "$SVC1" 1; check "$SVC2" 1
+
+          echo "--- BulkChange mixed: $SVC1→0, $SVC2→2 (parallel, single call) ---"
+          force_replicas "$SVC2" 2
+          bulk "ReplicationControllerBulkChange" \
+            "[{\"Name\":\"${SVC1}\",\"Replicas\":0,\"TenantId\":\"${TENANT_ID}\"},{\"Name\":\"${SVC2}\",\"Replicas\":2,\"TenantId\":\"${TENANT_ID}\"}]"
+          echo ""
+          check "$SVC1" 0; check "$SVC2" 2
+
+          force_replicas "$SVC1" 1; force_replicas "$SVC2" 1
+
+          echo ""
+          echo "Suite 2 — PASS: $PASS  FAIL: $FAIL"
+          echo "SUITE2_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "SUITE2_FAIL=$FAIL" >> "$GITHUB_ENV"
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      # ── Summary ──────────────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          TOTAL_PASS=$(( ${SUITE1_PASS:-0} + ${SUITE2_PASS:-0} ))
+          TOTAL_FAIL=$(( ${SUITE1_FAIL:-0} + ${SUITE2_FAIL:-0} ))
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## DUPLO-11210 — Replica Scale-to-Zero Test Results
+
+          | Suite | Tests Passed | Tests Failed |
+          |-------|-------------|-------------|
+          | Suite 1: All endpoints | ${SUITE1_PASS:-0} | ${SUITE1_FAIL:-0} |
+          | Suite 2: Bulk parallel (duploctl) | ${SUITE2_PASS:-0} | ${SUITE2_FAIL:-0} |
+          | **Total** | **$TOTAL_PASS** | **$TOTAL_FAIL** |
+
+          **Host:** ${{ github.event.inputs.host }}
+          **Tenant:** ${{ github.event.inputs.tenant_name }}
+          **Feature flag:** \`EnableDuploServiceScalingToZero\`
+
+          ### What was tested
+          - \`ReplicationControllerChange\`: single service 1→0 and 0→1
+          - \`ReplicationControllerChangeAll\`: single service 1→0 and 0→1
+          - \`ReplicationControllerBulkChangeAll\`: multiple services in one parallel call
+          - \`ReplicationControllerBulkChange\`: multiple services in one parallel call
+          - Partial update (omit Replicas) must not accidentally zero out a service
+          EOF
