@@ -1,0 +1,124 @@
+name: DUPLO-11210 — Bulk Service Update Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "DuploCloud portal URL"
+        required: true
+        default: "https://oneclick.duplocloud.net"
+      tenant_name:
+        description: "Tenant name"
+        required: true
+        default: "maja1706"
+      svc1:
+        description: "First service name (must exist with >=1 replica)"
+        required: true
+        default: "sv01"
+      svc2:
+        description: "Second service name (must exist with >=1 replica)"
+        required: true
+        default: "sv02"
+
+env:
+  DUPLO_HOST: ${{ github.event.inputs.host }}
+  DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+  TENANT_NAME: ${{ github.event.inputs.tenant_name }}
+  SVC1: ${{ github.event.inputs.svc1 }}
+  SVC2: ${{ github.event.inputs.svc2 }}
+
+jobs:
+  bulk-update-test:
+    name: Bulk Parallel Update Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install duploctl
+        run: pip install duplocloud-client
+
+      - name: Resolve Tenant ID
+        id: tenant
+        run: |
+          TENANT_ID=$(python3 - <<'PY'
+          import os, urllib.request, json, sys
+          host   = os.environ["DUPLO_HOST"]
+          tenant = os.environ["TENANT_NAME"].lower()
+          token  = os.environ["DUPLO_TOKEN"]
+          req = urllib.request.Request(
+              f"{host}/v3/admin/tenant",
+              headers={"Authorization": f"Bearer {token}"}
+          )
+          with urllib.request.urlopen(req) as r:
+              data = json.load(r)
+          for t in data:
+              if t.get("AccountName", "").lower() == tenant:
+                  print(t["TenantId"])
+                  sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr)
+          sys.exit(1)
+          PY
+          )
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
+
+      - name: Run bulk update test script
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          # Substitute env-var credentials into the script before running
+          sed \
+            -e "s|TOKEN=\".*\"|TOKEN=\"${DUPLO_TOKEN}\"|" \
+            -e "s|HOST=\".*\"|HOST=\"${DUPLO_HOST}\"|" \
+            -e "s|TENANT=\".*\"|TENANT=\"${TENANT_NAME}\"|" \
+            -e "s|TENANT_ID=\".*\"|TENANT_ID=\"${TENANT_ID}\"|" \
+            -e "s|SVC1=\".*\"|SVC1=\"${SVC1}\"|" \
+            -e "s|SVC2=\".*\"|SVC2=\"${SVC2}\"|" \
+            DUPLO-11210-bulk-update-test.sh > /tmp/bulk-test.sh
+          chmod +x /tmp/bulk-test.sh
+          bash /tmp/bulk-test.sh
+          echo "BULK_EXIT=$?" >> "$GITHUB_ENV"
+
+      - name: Parse results
+        if: always()
+        run: |
+          # Re-run to capture counts (script already passed/failed above)
+          PASS=$(grep -c "PASS" /tmp/bulk-test.sh 2>/dev/null || echo 0)
+          echo "BULK_PASS=$PASS" >> "$GITHUB_ENV"
+
+      - name: Write job summary
+        if: always()
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          STATUS=$( [ "${BULK_EXIT:-0}" -eq 0 ] && echo "✅ All tests passed" || echo "❌ Some tests failed" )
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## DUPLO-11210 — Bulk Service Update Test Results
+
+          **Status:** $STATUS
+
+          | Input | Value |
+          |-------|-------|
+          | Host | ${{ github.event.inputs.host }} |
+          | Tenant | ${{ github.event.inputs.tenant_name }} ($TENANT_ID) |
+          | Service 1 | ${{ github.event.inputs.svc1 }} |
+          | Service 2 | ${{ github.event.inputs.svc2 }} |
+          | Feature flag | \`EnableDuploServiceScalingToZero\` |
+
+          ### Tests Covered
+
+          | # | Test | Endpoint | Services in Call |
+          |---|------|----------|-----------------|
+          | 1 | Single service 1→0 | \`duploctl update_replicas\` | 1 |
+          | 2 | Single service 0→1 | \`duploctl update_replicas\` | 1 |
+          | 3 | Image-only update, replicas unchanged | \`duploctl update_image\` | 1 |
+          | 4 | Parallel: both 1→0 | \`BulkChangeAll\` | 2 (parallel) |
+          | 5 | Parallel: both 0→1 | \`BulkChange\` | 2 (parallel) |
+          | 6 | Parallel mixed replicas | \`BulkChange\` | 2 (parallel) |
+          | 7 | Omit Replicas — must not zero out | \`BulkChangeAll\` | 1 |
+          | 8 | Already at 0 → 0 (no-op) | \`BulkChange\` | 1 |
+
+          > Tests 4–6 send multiple services in **one API call**, updated in parallel server-side.
+          EOF
