@@ -332,22 +332,25 @@ jobs:
           echo "Test 3 — PASS: $PASS  FAIL: $FAIL"
           [ "$FAIL" -eq 0 ] || exit 1
 
-      - name: Restore all services to 1 replica
+      - name: Delete test services (cleanup)
         if: always()
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
           COUNT=${{ github.event.inputs.service_count }}
           PREFIX="${SERVICE_PREFIX}"
-          echo "Restoring all $COUNT services to 1 replica..."
+          echo "Deleting all $COUNT test services..."
           for i in $(seq -f "%02g" 1 $COUNT); do
             NAME="${PREFIX}-${i}"
-            curl -s -o /dev/null \
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $DUPLO_TOKEN" \
               -H "Content-Type: application/json" \
-              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
-              -d "{\"Name\":\"${NAME}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}"
-            echo "  Restored $NAME → 1"
+              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${NAME}")
+            if [ "$HTTP" = "200" ]; then
+              echo "  🗑️  Deleted $NAME"
+            else
+              echo "  ⚠️  $NAME → HTTP $HTTP (may not exist)"
+            fi
           done
 
       - name: Write job summary
