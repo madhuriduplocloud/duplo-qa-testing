@@ -39,30 +39,45 @@ jobs:
       - name: Install duploctl
         run: pip install duplocloud-client
 
-      - name: Resolve Tenant ID
+      - name: Validate token and resolve tenant ID
         id: tenant
         run: |
+          if [ -z "$DUPLO_TOKEN" ]; then
+            echo "❌ DUPLO_TOKEN secret is not set."
+            echo "Go to: Settings → Secrets and variables → Actions → New repository secret"
+            echo "Name: DUPLO_TOKEN"
+            echo "Value: your plain DuploCloud API token (from DuploCloud portal → profile icon → Token)"
+            exit 1
+          fi
+
+          HTTP=$(curl -s -o /tmp/tenants.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/v3/admin/tenant")
+
+          if [ "$HTTP" = "401" ]; then
+            echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."
+            echo "Get a fresh token from: ${DUPLO_HOST} → profile icon → Token"
+            exit 1
+          elif [ "$HTTP" != "200" ]; then
+            echo "❌ Unexpected HTTP $HTTP from ${DUPLO_HOST}/v3/admin/tenant"
+            cat /tmp/tenants.json
+            exit 1
+          fi
+
           TENANT_ID=$(python3 - <<'PY'
-          import os, urllib.request, json, sys
-          host   = os.environ["DUPLO_HOST"]
+          import json, sys, os
           tenant = os.environ["TENANT_NAME"].lower()
-          token  = os.environ["DUPLO_TOKEN"]
-          req = urllib.request.Request(
-              f"{host}/v3/admin/tenant",
-              headers={"Authorization": f"Bearer {token}"}
-          )
-          with urllib.request.urlopen(req) as r:
-              data = json.load(r)
+          data = json.load(open("/tmp/tenants.json"))
           for t in data:
               if t.get("AccountName", "").lower() == tenant:
                   print(t["TenantId"])
                   sys.exit(0)
-          print(f"Tenant '{tenant}' not found", file=sys.stderr)
+          print(f"Tenant '{tenant}' not found in: {[t.get('AccountName') for t in data]}", file=sys.stderr)
           sys.exit(1)
           PY
           )
           echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
-          echo "Resolved '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
+          echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
 
       - name: Run bulk update test script
         env:
