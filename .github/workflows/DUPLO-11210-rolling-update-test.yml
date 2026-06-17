@@ -1,0 +1,275 @@
+name: DUPLO-11210 — Rolling Update Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "DuploCloud portal URL"
+        required: true
+        default: "https://oneclick.duplocloud.net"
+      tenant_name:
+        description: "Tenant name"
+        required: true
+        default: "maja1706"
+      service_name:
+        description: "Test service name"
+        required: false
+        default: "rolling-update-test"
+      replicas:
+        description: "Replica count (min 3 to observe rolling behavior)"
+        required: false
+        default: "3"
+      image_initial:
+        description: "Initial image"
+        required: false
+        default: "nginx:1.24"
+      image_updated:
+        description: "Updated image (triggers rolling update)"
+        required: false
+        default: "nginx:1.25"
+
+env:
+  DUPLO_HOST: ${{ github.event.inputs.host }}
+  DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
+  TENANT_NAME: ${{ github.event.inputs.tenant_name }}
+  SVC: ${{ github.event.inputs.service_name }}
+  REPLICAS: ${{ github.event.inputs.replicas }}
+  IMAGE_INITIAL: ${{ github.event.inputs.image_initial }}
+  IMAGE_UPDATED: ${{ github.event.inputs.image_updated }}
+
+jobs:
+  rolling-update-test:
+    name: Rolling Update — ${{ github.event.inputs.service_name }} (${{ github.event.inputs.replicas }} replicas)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate token and resolve tenant ID
+        id: tenant
+        run: |
+          if [ -z "$DUPLO_TOKEN" ]; then
+            echo "❌ DUPLO_TOKEN secret is not set."; exit 1
+          fi
+          HTTP=$(curl -s -o /tmp/tenants.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/v3/admin/tenant")
+          if [ "$HTTP" = "401" ]; then
+            echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."; exit 1
+          elif [ "$HTTP" != "200" ]; then
+            echo "❌ Unexpected HTTP $HTTP"; cat /tmp/tenants.json; exit 1
+          fi
+          TENANT_ID=$(python3 - <<'PY'
+          import json, sys, os
+          tenant = os.environ["TENANT_NAME"].lower()
+          data = json.load(open("/tmp/tenants.json"))
+          for t in data:
+              if t.get("AccountName", "").lower() == tenant:
+                  print(t["TenantId"]); sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr); sys.exit(1)
+          PY
+          )
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+          echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
+          echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
+
+      # ── Create service with initial image ─────────────────────────────────
+      - name: Create service with ${{ github.event.inputs.replicas }} replicas (initial image)
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          echo "Creating '${SVC}' with Replicas=${REPLICAS}, Image=${IMAGE_INITIAL}..."
+          HTTP=$(curl -s -o /tmp/create.json -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+            -d "{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE_INITIAL}\",\"Replicas\":${REPLICAS},\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}")
+          echo "  HTTP: $HTTP"
+          [ "$HTTP" = "200" ] || { cat /tmp/create.json; exit 1; }
+
+      # ── Wait for all replicas to be ready ─────────────────────────────────
+      - name: Wait for all ${{ github.event.inputs.replicas }} replicas to be ready
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          echo "Waiting for ${REPLICAS} ready pods (up to 3 min)..."
+          for attempt in $(seq 1 36); do
+            READY=$(curl -s \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetPods" | \
+              python3 -c "
+import json, sys, os
+pods = json.load(sys.stdin)
+svc  = os.environ['SVC']
+ready = sum(1 for p in pods
+    if p.get('Name','').startswith(svc + '-')
+    and p.get('Phase','') == 'Running'
+    and not p.get('DeletionTimestamp'))
+print(ready)
+" 2>/dev/null)
+            echo "  Attempt $attempt/36 — Ready pods: ${READY}/${REPLICAS}"
+            [ "$READY" = "$REPLICAS" ] && break
+            sleep 5
+          done
+
+          if [ "$READY" != "$REPLICAS" ]; then
+            echo "❌ Only $READY/$REPLICAS pods ready after 3 min — aborting"
+            exit 1
+          fi
+          echo "✅ All ${REPLICAS} pods ready with image ${IMAGE_INITIAL}"
+
+      # ── TEST 1: Trigger rolling update and monitor pod availability ───────
+      - name: "TEST 1 — Trigger rolling update and verify pods never all go down"
+        id: test1
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          echo "Triggering rolling update: ${IMAGE_INITIAL} → ${IMAGE_UPDATED}"
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
+            -d "{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE_UPDATED}\",\"TenantId\":\"${TENANT_ID}\"}"
+
+          echo "Monitoring pod availability during rolling update (2 min)..."
+          MIN_RUNNING=$REPLICAS
+          MAX_SEEN=0
+          POLL=0
+
+          for i in $(seq 1 60); do
+            RUNNING=$(curl -s \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetPods" | \
+              python3 -c "
+import json, sys, os
+pods = json.load(sys.stdin)
+svc  = os.environ['SVC']
+running = sum(1 for p in pods
+    if p.get('Name','').startswith(svc + '-')
+    and p.get('Phase','') == 'Running'
+    and not p.get('DeletionTimestamp'))
+print(running)
+" 2>/dev/null)
+            RUNNING=${RUNNING:-0}
+            POLL=$((POLL+1))
+            echo "  Poll $POLL/60 — Running pods: ${RUNNING}/${REPLICAS}"
+            [ "$RUNNING" -lt "$MIN_RUNNING" ] && MIN_RUNNING=$RUNNING
+            [ "$RUNNING" -gt "$MAX_SEEN" ]    && MAX_SEEN=$RUNNING
+            sleep 2
+          done
+
+          echo ""
+          echo "MIN running pods during update : $MIN_RUNNING"
+          echo "MAX running pods during update : $MAX_SEEN"
+          echo "MIN_RUNNING=$MIN_RUNNING" >> "$GITHUB_ENV"
+
+          if [ "$MIN_RUNNING" -gt 0 ]; then
+            echo "✅ TEST 1 PASS — pods never fully down during rolling update (min=$MIN_RUNNING)"
+            echo "TEST1=PASS (min ${MIN_RUNNING}/${REPLICAS} always running)" >> "$GITHUB_ENV"
+          else
+            echo "❌ TEST 1 FAIL — all pods were down simultaneously at some point!"
+            echo "TEST1=FAIL (pods dropped to 0)" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      # ── TEST 2: Verify final state — all replicas running with new image ──
+      - name: "TEST 2 — Verify all replicas running with updated image"
+        id: test2
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          echo "Waiting for all ${REPLICAS} pods to be ready with ${IMAGE_UPDATED}..."
+          for attempt in $(seq 1 24); do
+            READY=$(curl -s \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetPods" | \
+              python3 -c "
+import json, sys, os
+pods = json.load(sys.stdin)
+svc  = os.environ['SVC']
+img  = os.environ['IMAGE_UPDATED']
+ready = sum(1 for p in pods
+    if p.get('Name','').startswith(svc + '-')
+    and p.get('Phase','') == 'Running'
+    and not p.get('DeletionTimestamp')
+    and any(img in c.get('Image','') for c in p.get('Containers', [])))
+print(ready)
+" 2>/dev/null)
+            echo "  Attempt $attempt/24 — Pods with new image: ${READY:-0}/${REPLICAS}"
+            [ "${READY:-0}" = "$REPLICAS" ] && break
+            sleep 5
+          done
+
+          if [ "${READY:-0}" = "$REPLICAS" ]; then
+            echo "✅ TEST 2 PASS — all ${REPLICAS} pods running with ${IMAGE_UPDATED}"
+            echo "TEST2=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TEST 2 FAIL — only ${READY:-0}/${REPLICAS} pods on new image after update"
+            echo "TEST2=FAIL" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      # ── TEST 3: Verify replica count unchanged after update ───────────────
+      - name: "TEST 3 — Verify Replicas count unchanged after rolling update"
+        id: test3
+        env:
+          TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
+        run: |
+          R=$(curl -s \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
+
+          echo "  Replicas after rolling update: $R (expected ${REPLICAS})"
+          if [ "$R" = "$REPLICAS" ]; then
+            echo "✅ TEST 3 PASS — Replicas=${R} unchanged"
+            echo "TEST3=PASS" >> "$GITHUB_ENV"
+          else
+            echo "❌ TEST 3 FAIL — Expected ${REPLICAS}, got ${R}"
+            echo "TEST3=FAIL" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Delete test service (cleanup)
+        if: always()
+        run: |
+          echo "Deleting '${SVC}' (TENANT_ID=${TENANT_ID})..."
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $DUPLO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
+          if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
+            echo "  🗑️  Deleted ${SVC} (HTTP $HTTP)"
+          else
+            echo "  ⚠️  ${SVC} → HTTP $HTTP"
+          fi
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          result() {
+            case "$1" in PASS*) echo "✅ $1";; FAIL*) echo "❌ $1";; *) echo "⏭️  SKIP";; esac
+          }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## DUPLO-11210 — Rolling Update Test Results
+
+          **Host:** ${{ github.event.inputs.host }}
+          **Tenant:** ${{ github.event.inputs.tenant_name }}
+          **Service:** ${{ github.event.inputs.service_name }}
+          **Replicas:** ${{ github.event.inputs.replicas }}
+          **Initial image:** ${{ github.event.inputs.image_initial }}
+          **Updated image:** ${{ github.event.inputs.image_updated }}
+
+          | Test | Description | Result |
+          |------|-------------|--------|
+          | 1 | Pods never all go down during rolling update (min running > 0) | $(result "${TEST1:-}") |
+          | 2 | All replicas running with new image after update | $(result "${TEST2:-}") |
+          | 3 | Replica count unchanged after rolling update | $(result "${TEST3:-}") |
+
+          > Rolling update polls pod availability every 2s for 2 minutes during the image change.
+          > A passing TEST 1 means at least 1 pod was always running — no full outage.
+          EOF
