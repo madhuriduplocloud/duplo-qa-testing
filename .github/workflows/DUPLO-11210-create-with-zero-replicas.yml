@@ -1,4 +1,4 @@
-name: DUPLO-11210 — Create Service with Zero Replicas
+name: DUPLO-11210 — Create Services with Zero Replicas (Bulk)
 
 on:
   workflow_dispatch:
@@ -11,10 +11,14 @@ on:
         description: "Tenant name"
         required: true
         default: "maja1706"
-      service_name:
-        description: "Test service name"
+      service_prefix:
+        description: "Service name prefix (services named <prefix>-01 to <prefix>-N)"
         required: false
-        default: "zero-replica-test"
+        default: "zero-create"
+      service_count:
+        description: "Number of services to create with Replicas=0 (max 10)"
+        required: false
+        default: "10"
       image:
         description: "Container image"
         required: false
@@ -24,12 +28,13 @@ env:
   DUPLO_HOST: ${{ github.event.inputs.host }}
   DUPLO_TOKEN: ${{ secrets.DUPLO_TOKEN }}
   TENANT_NAME: ${{ github.event.inputs.tenant_name }}
-  SVC: ${{ github.event.inputs.service_name }}
+  PREFIX: ${{ github.event.inputs.service_prefix }}
+  COUNT: ${{ github.event.inputs.service_count }}
   IMAGE: ${{ github.event.inputs.image }}
 
 jobs:
   create-zero-replicas:
-    name: Create service with Replicas=0 and verify behaviour
+    name: Create ${{ github.event.inputs.service_count }} services with Replicas=0 and verify
     runs-on: ubuntu-latest
 
     steps:
@@ -40,186 +45,215 @@ jobs:
         id: tenant
         run: |
           if [ -z "$DUPLO_TOKEN" ]; then
-            echo "❌ DUPLO_TOKEN secret is not set."
-            exit 1
+            echo "❌ DUPLO_TOKEN secret is not set."; exit 1
           fi
-
           HTTP=$(curl -s -o /tmp/tenants.json -w "%{http_code}" \
             -H "Authorization: Bearer $DUPLO_TOKEN" \
             "${DUPLO_HOST}/v3/admin/tenant")
-
           if [ "$HTTP" = "401" ]; then
-            echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."
-            exit 1
+            echo "❌ 401 Unauthorized — DUPLO_TOKEN is invalid or expired."; exit 1
           elif [ "$HTTP" != "200" ]; then
-            echo "❌ Unexpected HTTP $HTTP"
-            cat /tmp/tenants.json
-            exit 1
+            echo "❌ Unexpected HTTP $HTTP"; cat /tmp/tenants.json; exit 1
           fi
-
           TENANT_ID=$(python3 - <<'PY'
           import json, sys, os
           tenant = os.environ["TENANT_NAME"].lower()
           data = json.load(open("/tmp/tenants.json"))
           for t in data:
               if t.get("AccountName", "").lower() == tenant:
-                  print(t["TenantId"])
-                  sys.exit(0)
-          print(f"Tenant '{tenant}' not found", file=sys.stderr)
-          sys.exit(1)
+                  print(t["TenantId"]); sys.exit(0)
+          print(f"Tenant '{tenant}' not found", file=sys.stderr); sys.exit(1)
           PY
           )
           echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
           echo "✅ Resolved tenant '${{ github.event.inputs.tenant_name }}' → $TENANT_ID"
 
-      - name: TEST 1 — Create service with Replicas=0
+      # ── TEST 1: Create all services with Replicas=0 ───────────────────────
+      - name: TEST 1 — Create ${{ github.event.inputs.service_count }} services with Replicas=0
         id: test1
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          echo "Creating service '${SVC}' with Replicas=0..."
-          RESP=$(curl -s -w "\n%{http_code}" \
-            -H "Authorization: Bearer $DUPLO_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
-            -d "{\"Name\":\"${SVC}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":0,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}")
-          HTTP=$(echo "$RESP" | tail -1)
-          BODY=$(echo "$RESP" | head -1)
-          echo "  HTTP: $HTTP"
-          echo "  Body: $BODY"
+          echo "Creating ${COUNT} services with Replicas=0..."
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 ${COUNT}); do
+            NAME="${PREFIX}-${i}"
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate" \
+              -d "{\"Name\":\"${NAME}\",\"DockerImage\":\"${IMAGE}\",\"Replicas\":0,\"AgentPlatform\":7,\"IsDaemonset\":false,\"TenantId\":\"${TENANT_ID}\"}")
+            if [ "$HTTP" = "200" ]; then
+              echo "  ✅ $NAME created (Replicas=0)"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $NAME failed — HTTP $HTTP"
+              FAIL=$((FAIL+1))
+            fi
+          done
+          echo "TEST1_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST1_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 1 — Created: $PASS  Failed: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
 
-          if [ "$HTTP" = "200" ]; then
-            echo "  ✅ Service created (API accepted Replicas=0)"
-            echo "TEST1_RESULT=PASS" >> "$GITHUB_ENV"
-          else
-            echo "  ❌ Service creation failed — API rejected Replicas=0 on create"
-            echo "TEST1_RESULT=FAIL" >> "$GITHUB_ENV"
-            exit 1
-          fi
-
-      - name: TEST 2 — Verify service exists with Replicas=0 immediately after creation
+      # ── TEST 2: Verify all services report Replicas=0 ────────────────────
+      - name: TEST 2 — Verify all ${{ github.event.inputs.service_count }} services report Replicas=0
         id: test2
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          # Poll up to 30s for the service to appear
-          echo "Waiting for service to appear in GetReplicationControllers..."
-          REPLICAS=""
-          for attempt in $(seq 1 6); do
-            REPLICAS=$(curl -s \
-              -H "Authorization: Bearer $DUPLO_TOKEN" \
-              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
-              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
-            [ -n "$REPLICAS" ] && break
-            echo "  Attempt $attempt/6 — service not visible yet, waiting 5s..."
+          echo "Polling until all services appear at Replicas=0 (up to 60s)..."
+          for attempt in $(seq 1 12); do
+            NOT_READY=0
+            for i in $(seq -f "%02g" 1 ${COUNT}); do
+              R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+                "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+                python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${PREFIX}-${i}']" 2>/dev/null)
+              [ "$R" != "0" ] && NOT_READY=$((NOT_READY+1))
+            done
+            [ "$NOT_READY" -eq 0 ] && break
+            echo "  Attempt $attempt/12 — $NOT_READY service(s) not yet at 0, waiting 5s..."
             sleep 5
           done
 
-          echo "  Replicas reported: '$REPLICAS'"
-          if [ "$REPLICAS" = "0" ]; then
-            echo "  ✅ Service is at Replicas=0 as created"
-            echo "TEST2_RESULT=PASS" >> "$GITHUB_ENV"
-          else
-            echo "  ❌ Expected Replicas=0, got '$REPLICAS'"
-            echo "TEST2_RESULT=FAIL" >> "$GITHUB_ENV"
-            exit 1
-          fi
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 ${COUNT}); do
+            NAME="${PREFIX}-${i}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            if [ "$R" = "0" ]; then
+              echo "  ✅ $NAME: Replicas=0"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $NAME: Expected 0, got '$R'"
+              FAIL=$((FAIL+1))
+            fi
+          done
+          echo "TEST2_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST2_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 2 — PASS: $PASS  FAIL: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
 
-      - name: TEST 3 — Wait 2 min and verify service stays at 0 (no auto-start)
+      # ── TEST 3: Wait 2 min — all services must stay at 0 (no auto-start) ─
+      - name: TEST 3 — Wait 2 min — all services must not auto-start
         id: test3
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          echo "⏳ Waiting 2 minutes to confirm service is not auto-started..."
-          for i in $(seq 120 -10 10); do
-            echo "  $i seconds remaining..."
-            sleep 10
+          echo "⏳ Waiting 2 minutes to verify no service auto-starts..."
+          for i in $(seq 120 -10 10); do echo "  $i seconds remaining..."; sleep 10; done
+          echo "✅ Wait complete. Checking all ${COUNT} services..."
+
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 ${COUNT}); do
+            NAME="${PREFIX}-${i}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            if [ "$R" = "0" ]; then
+              echo "  ✅ $NAME: still Replicas=0 (not auto-started)"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $NAME: auto-started to Replicas=$R — unexpected!"
+              FAIL=$((FAIL+1))
+            fi
           done
-          echo "✅ Wait complete. Checking replica count..."
+          echo "TEST3_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST3_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 3 — PASS: $PASS  FAIL: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
 
-          REPLICAS=$(curl -s \
-            -H "Authorization: Bearer $DUPLO_TOKEN" \
-            "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
-            python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
-
-          echo "  Replicas after 2 min: '$REPLICAS'"
-          if [ "$REPLICAS" = "0" ]; then
-            echo "  ✅ Service stayed at Replicas=0 — no auto-start"
-            echo "TEST3_RESULT=PASS" >> "$GITHUB_ENV"
-          else
-            echo "  ❌ Service auto-started to Replicas=$REPLICAS — unexpected!"
-            echo "TEST3_RESULT=FAIL" >> "$GITHUB_ENV"
-            exit 1
-          fi
-
-      - name: TEST 4 — Scale up from 0 to 1 (verify stopped service can be started)
+      # ── TEST 4: Bulk scale all services 0→1 via BulkChange ───────────────
+      - name: TEST 4 — BulkChange all ${{ github.event.inputs.service_count }} services 0→1
         id: test4
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          echo "Scaling '${SVC}' from 0 → 1..."
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+          PAYLOAD=$(python3 -c "
+          import json, os
+          count  = int(os.environ['COUNT'])
+          prefix = os.environ['PREFIX']
+          tid    = os.environ['TENANT_ID']
+          svcs   = [{'Name': f'{prefix}-{i:02d}', 'Replicas': 1, 'TenantId': tid} for i in range(1, count+1)]
+          print(json.dumps(svcs))
+          ")
+
+          echo "Sending BulkChange for ${COUNT} services → 1"
+          HTTP=$(curl -s -o /tmp/bulk_tc4.json -w "%{http_code}" \
             -H "Authorization: Bearer $DUPLO_TOKEN" \
             -H "Content-Type: application/json" \
-            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerChangeAll" \
-            -d "{\"Name\":\"${SVC}\",\"Replicas\":1,\"TenantId\":\"${TENANT_ID}\"}")
+            -X POST "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerBulkChange" \
+            -d "$PAYLOAD")
           echo "  HTTP: $HTTP"
 
-          # Poll up to 60s for replica count to reach 1
-          echo "  Waiting for service to reach 1 replica..."
-          REPLICAS=""
           for attempt in $(seq 1 12); do
-            REPLICAS=$(curl -s \
-              -H "Authorization: Bearer $DUPLO_TOKEN" \
-              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
-              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${SVC}']" 2>/dev/null)
-            [ "$REPLICAS" = "1" ] && break
-            echo "  Attempt $attempt/12 — Replicas=$REPLICAS, waiting 5s..."
-            sleep 5
+            NOT_READY=0
+            for i in $(seq -f "%02g" 1 ${COUNT}); do
+              R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+                "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+                python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${PREFIX}-${i}']" 2>/dev/null)
+              [ "$R" != "1" ] && NOT_READY=$((NOT_READY+1))
+            done
+            [ "$NOT_READY" -eq 0 ] && break
+            echo "  Attempt $attempt/12 — $NOT_READY not at 1, waiting 5s..."; sleep 5
           done
 
-          if [ "$REPLICAS" = "1" ]; then
-            echo "  ✅ Service scaled up to Replicas=1"
-            echo "TEST4_RESULT=PASS" >> "$GITHUB_ENV"
-          else
-            echo "  ❌ Expected Replicas=1, got '$REPLICAS'"
-            echo "TEST4_RESULT=FAIL" >> "$GITHUB_ENV"
-            exit 1
-          fi
+          PASS=0; FAIL=0
+          for i in $(seq -f "%02g" 1 ${COUNT}); do
+            NAME="${PREFIX}-${i}"
+            R=$(curl -s -H "Authorization: Bearer $DUPLO_TOKEN" \
+              "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetReplicationControllers" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); [print(s['Replicas']) for s in d if s['Name']=='${NAME}']" 2>/dev/null)
+            if [ "$R" = "1" ]; then
+              echo "  ✅ $NAME: Replicas=1"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $NAME: Expected 1, got '$R'"
+              FAIL=$((FAIL+1))
+            fi
+          done
+          echo "TEST4_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "TEST4_FAIL=$FAIL" >> "$GITHUB_ENV"
+          echo "Test 4 — PASS: $PASS  FAIL: $FAIL"
+          [ "$FAIL" -eq 0 ] || exit 1
 
-      - name: Delete test service (cleanup)
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Delete all test services (cleanup)
         if: always()
         env:
           TENANT_ID: ${{ steps.tenant.outputs.tenant_id }}
         run: |
-          echo "Deleting test service '${SVC}'..."
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $DUPLO_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
-          if [ "$HTTP" = "200" ]; then
-            echo "  🗑️  Deleted ${SVC}"
-          else
-            echo "  ⚠️  HTTP $HTTP — service may not exist or already deleted"
-          fi
+          echo "Deleting ${COUNT} test services..."
+          for i in $(seq -f "%02g" 1 ${COUNT}); do
+            NAME="${PREFIX}-${i}"
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $DUPLO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${NAME}")
+            [ "$HTTP" = "200" ] && echo "  🗑️  Deleted $NAME" || echo "  ⚠️  $NAME → HTTP $HTTP"
+          done
 
+      # ── Summary ───────────────────────────────────────────────────────────
       - name: Write job summary
         if: always()
         run: |
-          icon() { [ "$1" = "PASS" ] && echo "✅" || echo "❌"; }
+          result() {
+            case "$1" in PASS*) echo "✅ $1";; FAIL*) echo "❌ $1";; *) echo "⏭️  SKIP";; esac
+          }
 
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## DUPLO-11210 — Create Service with Zero Replicas
+          ## DUPLO-11210 — Create ${{ github.event.inputs.service_count }} Services with Replicas=0
 
           **Host:** ${{ github.event.inputs.host }}
           **Tenant:** ${{ github.event.inputs.tenant_name }}
-          **Service:** ${{ github.event.inputs.service_name }}
+          **Services:** ${{ github.event.inputs.service_prefix }}-01 to ${{ github.event.inputs.service_prefix }}-${{ github.event.inputs.service_count }}
           **Feature flag:** \`EnableDuploServiceScalingToZero\`
 
           | Test | Description | Result |
           |------|-------------|--------|
-          | 1 | Create service with Replicas=0 (API must accept) | $(icon "${TEST1_RESULT:-SKIP}") ${TEST1_RESULT:-SKIP} |
-          | 2 | Verify service reports Replicas=0 immediately | $(icon "${TEST2_RESULT:-SKIP}") ${TEST2_RESULT:-SKIP} |
-          | 3 | Wait 2 min — service must not auto-start | $(icon "${TEST3_RESULT:-SKIP}") ${TEST3_RESULT:-SKIP} |
-          | 4 | Scale 0→1 — stopped service can be started | $(icon "${TEST4_RESULT:-SKIP}") ${TEST4_RESULT:-SKIP} |
+          | 1 | Create ${{ github.event.inputs.service_count }} services with Replicas=0 (API must accept) | $(result "${TEST1_PASS:+PASS (${TEST1_PASS}/${{ github.event.inputs.service_count }})}${TEST1_FAIL:+FAIL (${TEST1_FAIL} failed)}") |
+          | 2 | All services report Replicas=0 immediately after creation | $(result "${TEST2_PASS:+PASS (${TEST2_PASS}/${{ github.event.inputs.service_count }})}${TEST2_FAIL:+FAIL (${TEST2_FAIL} failed)}") |
+          | 3 | Wait 2 min — no service auto-starts | $(result "${TEST3_PASS:+PASS (${TEST3_PASS}/${{ github.event.inputs.service_count }})}${TEST3_FAIL:+FAIL (${TEST3_FAIL} failed)}") |
+          | 4 | BulkChange all services 0→1 (can be started after created stopped) | $(result "${TEST4_PASS:+PASS (${TEST4_PASS}/${{ github.event.inputs.service_count }})}${TEST4_FAIL:+FAIL (${TEST4_FAIL} failed)}") |
           EOF
