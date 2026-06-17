@@ -69,11 +69,10 @@ jobs:
           kubectl config set-credentials oneclick-user --token="$K8S_TOKEN"
           kubectl get nodes --no-headers | awk '{print $1, $2}'
 
-      - name: Verify KEDA is installed on cluster
+      - name: Install KEDA if not present
         run: |
-          # Tenant-level kubeconfig may not have permission to list CRDs (cluster-scoped).
-          # Use a dry-run ScaledObject apply to detect if KEDA CRD exists.
-          cat <<'EOF' > /tmp/keda-check.yaml
+          # Check if KEDA ScaledObject CRD is available via dry-run
+          cat > /tmp/keda-probe.yaml << 'EOF'
           apiVersion: keda.sh/v1alpha1
           kind: ScaledObject
           metadata:
@@ -92,13 +91,20 @@ jobs:
                 end: "59 23 * * *"
                 desiredReplicas: "1"
           EOF
-          if kubectl apply --dry-run=server -f /tmp/keda-check.yaml &>/dev/null; then
-            echo "✅ KEDA is installed on the cluster (ScaledObject CRD exists)"
+
+          if kubectl apply --dry-run=server -f /tmp/keda-probe.yaml 2>/dev/null; then
+            echo "✅ KEDA already installed — skipping install"
           else
-            echo "❌ KEDA is NOT installed on the oneclick cluster."
-            echo "   KEDA must be pre-installed by a cluster-admin before running this test."
-            echo "   Install with: helm install keda kedacore/keda --namespace keda --create-namespace"
-            exit 1
+            echo "KEDA not found — installing via Helm (requires cluster-admin)..."
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+            helm repo add kedacore https://kedacore.github.io/charts
+            helm repo update kedacore
+            helm upgrade --install keda kedacore/keda \
+              --namespace keda \
+              --create-namespace \
+              --wait \
+              --timeout 5m
+            echo "✅ KEDA installed"
           fi
 
       - name: Create EKS Service
