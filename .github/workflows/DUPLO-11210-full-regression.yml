@@ -456,28 +456,22 @@ jobs:
       - name: Delete all test services (cleanup)
         if: always()
         run: |
-          echo "Deleting all test services (TENANT_ID=${TENANT_ID})..."
+          pip install -q duplocloud-client
+          DC="duploctl --host $DUPLO_HOST --token $DUPLO_TOKEN --tenant $TENANT_NAME"
+          echo "Deleting all test services..."
           for SVC in "${PREFIX}-static" "${PREFIX}-zero-create" "${PREFIX}-stateful"; do
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer $DUPLO_TOKEN" \
-              -H "Content-Type: application/json" \
-              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
-            if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
-              echo "  🗑️  Deleted $SVC (HTTP $HTTP)"
+            if $DC service delete "$SVC" > /dev/null 2>&1; then
+              echo "  🗑️  Deleted $SVC"
             else
-              echo "  ⚠️  $SVC → HTTP $HTTP"
+              echo "  ⚠️  Could not delete $SVC (may not exist)"
             fi
           done
           for i in $(seq -f "%02g" 1 ${BULK_COUNT}); do
             SVC="${PREFIX}-bulk-${i}"
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer $DUPLO_TOKEN" \
-              -H "Content-Type: application/json" \
-              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
-            if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
-              echo "  🗑️  Deleted $SVC (HTTP $HTTP)"
+            if $DC service delete "$SVC" > /dev/null 2>&1; then
+              echo "  🗑️  Deleted $SVC"
             else
-              echo "  ⚠️  $SVC → HTTP $HTTP"
+              echo "  ⚠️  Could not delete $SVC (may not exist)"
             fi
           done
 

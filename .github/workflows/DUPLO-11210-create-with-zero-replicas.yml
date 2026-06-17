@@ -223,17 +223,15 @@ jobs:
       - name: Delete all test services (cleanup)
         if: always()
         run: |
-          echo "Deleting ${COUNT} test services (TENANT_ID=${TENANT_ID})..."
+          pip install -q duplocloud-client
+          DC="duploctl --host $DUPLO_HOST --token $DUPLO_TOKEN --tenant $TENANT_NAME"
+          echo "Deleting ${COUNT} test services..."
           for i in $(seq -f "%02g" 1 ${COUNT}); do
             NAME="${PREFIX}-${i}"
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer $DUPLO_TOKEN" \
-              -H "Content-Type: application/json" \
-              -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${NAME}")
-            if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
-              echo "  🗑️  Deleted $NAME (HTTP $HTTP)"
+            if $DC service delete "$NAME" > /dev/null 2>&1; then
+              echo "  🗑️  Deleted $NAME"
             else
-              echo "  ⚠️  $NAME → HTTP $HTTP"
+              echo "  ⚠️  Could not delete $NAME (may not exist)"
             fi
           done
 

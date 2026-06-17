@@ -235,15 +235,13 @@ print(ready)
       - name: Delete test service (cleanup)
         if: always()
         run: |
-          echo "Deleting '${SVC}' (TENANT_ID=${TENANT_ID})..."
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $DUPLO_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X DELETE "${DUPLO_HOST}/subscriptions/${TENANT_ID}/ReplicationControllerUpdate/${SVC}")
-          if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
-            echo "  🗑️  Deleted ${SVC} (HTTP $HTTP)"
+          pip install -q duplocloud-client
+          DC="duploctl --host $DUPLO_HOST --token $DUPLO_TOKEN --tenant $TENANT_NAME"
+          echo "Deleting '${SVC}'..."
+          if $DC service delete "$SVC" > /dev/null 2>&1; then
+            echo "  🗑️  Deleted ${SVC}"
           else
-            echo "  ⚠️  ${SVC} → HTTP $HTTP"
+            echo "  ⚠️  Could not delete ${SVC} (may not exist)"
           fi
 
       # ── Summary ───────────────────────────────────────────────────────────
