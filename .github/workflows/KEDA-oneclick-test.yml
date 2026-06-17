@@ -56,8 +56,17 @@ jobs:
       - name: Setup kubeconfig
         run: |
           mkdir -p ~/.kube
+          # Write cluster config (cert + server) from secret
           echo "${{ secrets.KUBECONFIG_ONECLICK }}" > ~/.kube/config
           chmod 600 ~/.kube/config
+          # Get k8s credentials dynamically using DUPLO_TOKEN
+          TOKEN_JSON=$(duplo-jit k8s \
+            --host="$DUPLO_HOST" \
+            --token="$DUPLO_TOKEN" \
+            --tenant="${{ inputs.tenant }}")
+          K8S_TOKEN=$(echo "$TOKEN_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['status']['token'])")
+          # Patch the static exec-based kubeconfig to use the resolved token instead
+          kubectl config set-credentials oneclick-user --token="$K8S_TOKEN"
           kubectl get nodes --no-headers | awk '{print $1, $2}'
 
       - name: Verify KEDA is installed on cluster
