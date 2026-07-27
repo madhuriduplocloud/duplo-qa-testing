@@ -280,3 +280,59 @@ jobs:
 
       - name: Simulate downstream consumer logging the token
         run: echo "consumer received K8S_TOKEN=${{ steps.jit.outputs.K8S_TOKEN }}"
+
+  # TC09: k8s_context is a separate public command from k8s. k8s() wraps
+  # k8s_context()'s raw API response and masks the token before returning;
+  # k8s_context() itself returns that raw response (including the same
+  # Token field) with no _mask_in_ci call anywhere in the method. So this
+  # should leak in BOTH the before-fix and after-fix jobs -- there's no fix
+  # for this path to verify.
+  k8s-context-before-fix:
+    name: "k8s_context BEFORE fix (should LEAK token in logs)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (pre-fix commit)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+
+      - name: Get raw JIT k8s context
+        id: jit
+        run: |
+          duploctl jit k8s_context \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{K8S_CONTEXT_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
+
+  k8s-context-after-fix:
+    name: "k8s_context AFTER fix (STILL LEAKS -- gap, not fixed)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - name: Get raw JIT k8s context
+        id: jit
+        run: |
+          duploctl jit k8s_context \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{K8S_CONTEXT_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
