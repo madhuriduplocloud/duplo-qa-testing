@@ -99,15 +99,15 @@ jobs:
               -H "Authorization: Bearer $DUPLO_TOKEN" \
               "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetPods" | \
               python3 -c "
-import json, sys, os
-pods = json.load(sys.stdin)
-svc  = os.environ['SVC']
-ready = sum(1 for p in pods
-    if p.get('Name','').startswith(svc + '-')
-    and p.get('Phase','') == 'Running'
-    and not p.get('DeletionTimestamp'))
-print(ready)
-" 2>/dev/null)
+              import json, sys, os
+              pods = json.load(sys.stdin)
+              svc  = os.environ['SVC']
+              ready = sum(1 for p in pods
+                  if p.get('Name','').startswith(svc + '-')
+                  and p.get('Phase','') == 'Running'
+                  and not p.get('DeletionTimestamp'))
+              print(ready)
+              " 2>/dev/null)
             echo "  Attempt $attempt/36 — Ready pods: ${READY}/${REPLICAS}"
             [ "$READY" = "$REPLICAS" ] && break
             sleep 5
@@ -142,15 +142,15 @@ print(ready)
               -H "Authorization: Bearer $DUPLO_TOKEN" \
               "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetPods" | \
               python3 -c "
-import json, sys, os
-pods = json.load(sys.stdin)
-svc  = os.environ['SVC']
-running = sum(1 for p in pods
-    if p.get('Name','').startswith(svc + '-')
-    and p.get('Phase','') == 'Running'
-    and not p.get('DeletionTimestamp'))
-print(running)
-" 2>/dev/null)
+              import json, sys, os
+              pods = json.load(sys.stdin)
+              svc  = os.environ['SVC']
+              running = sum(1 for p in pods
+                  if p.get('Name','').startswith(svc + '-')
+                  and p.get('Phase','') == 'Running'
+                  and not p.get('DeletionTimestamp'))
+              print(running)
+              " 2>/dev/null)
             RUNNING=${RUNNING:-0}
             POLL=$((POLL+1))
             echo "  Poll $POLL/60 — Running pods: ${RUNNING}/${REPLICAS}"
@@ -185,17 +185,17 @@ print(running)
               -H "Authorization: Bearer $DUPLO_TOKEN" \
               "${DUPLO_HOST}/subscriptions/${TENANT_ID}/GetPods" | \
               python3 -c "
-import json, sys, os
-pods = json.load(sys.stdin)
-svc  = os.environ['SVC']
-img  = os.environ['IMAGE_UPDATED']
-ready = sum(1 for p in pods
-    if p.get('Name','').startswith(svc + '-')
-    and p.get('Phase','') == 'Running'
-    and not p.get('DeletionTimestamp')
-    and any(img in c.get('Image','') for c in p.get('Containers', [])))
-print(ready)
-" 2>/dev/null)
+              import json, sys, os
+              pods = json.load(sys.stdin)
+              svc  = os.environ['SVC']
+              img  = os.environ['IMAGE_UPDATED']
+              ready = sum(1 for p in pods
+                  if p.get('Name','').startswith(svc + '-')
+                  and p.get('Phase','') == 'Running'
+                  and not p.get('DeletionTimestamp')
+                  and any(img in c.get('Image','') for c in p.get('Containers', [])))
+              print(ready)
+              " 2>/dev/null)
             echo "  Attempt $attempt/24 — Pods with new image: ${READY:-0}/${REPLICAS}"
             [ "${READY:-0}" = "$REPLICAS" ] && break
             sleep 5
