@@ -497,3 +497,187 @@ jobs:
           duploctl jit k8s_context --host "${{ secrets.DUPLO_HOST_NOV }}" --token "${{ secrets.DUPLO_TOKEN_NOV }}" --tenant "${{ secrets.DUPLO_TENANT_NOV }}" \
             -o env -q '{K8S_CONTEXT_TOKEN: Token}' >> "$GITHUB_OUTPUT"
       - run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
+
+  # ---------- JAN / QA-GOVCLOUD ENVIRONMENT (qa-govcloud.duplocloud.net / maja2707) ----------
+
+  jan-aws-before-fix:
+    name: "[jan] aws BEFORE fix (should LEAK creds)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+      - id: jit
+        run: |
+          duploctl jit aws --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{AWS_ACCESS_KEY_ID: AccessKeyId, AWS_SECRET_ACCESS_KEY: SecretAccessKey, AWS_SESSION_TOKEN: SessionToken, AWS_REGION: Region}' >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ steps.jit.outputs.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ steps.jit.outputs.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ steps.jit.outputs.AWS_SESSION_TOKEN }}
+          aws-region: ${{ steps.jit.outputs.AWS_REGION }}
+      - run: aws sts get-caller-identity
+
+  jan-aws-after-fix:
+    name: "[jan] aws AFTER fix (should be masked ***)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+      - id: jit
+        run: |
+          duploctl jit aws --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{AWS_ACCESS_KEY_ID: AccessKeyId, AWS_SECRET_ACCESS_KEY: SecretAccessKey, AWS_SESSION_TOKEN: SessionToken, AWS_REGION: Region}' >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ steps.jit.outputs.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ steps.jit.outputs.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ steps.jit.outputs.AWS_SESSION_TOKEN }}
+          aws-region: ${{ steps.jit.outputs.AWS_REGION }}
+      - run: aws sts get-caller-identity
+
+  jan-aws-consoleurl-before-fix:
+    name: "[jan] aws ConsoleUrl BEFORE fix (should LEAK)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+      - id: jit
+        run: |
+          duploctl jit aws --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{CONSOLE_URL: ConsoleUrl}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received CONSOLE_URL=${{ steps.jit.outputs.CONSOLE_URL }}"
+
+  jan-aws-consoleurl-after-fix:
+    name: "[jan] aws ConsoleUrl AFTER fix (should be masked ***)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+      - id: jit
+        run: |
+          duploctl jit aws --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{CONSOLE_URL: ConsoleUrl}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received CONSOLE_URL=${{ steps.jit.outputs.CONSOLE_URL }}"
+
+  jan-aws-admin-before-fix:
+    name: "[jan] aws --admin BEFORE fix (should LEAK)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+      - id: jit
+        run: |
+          duploctl jit aws --admin --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" \
+            -o env -q '{ADMIN_ACCESS_KEY: AccessKeyId}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received ADMIN_ACCESS_KEY=${{ steps.jit.outputs.ADMIN_ACCESS_KEY }}"
+
+  jan-aws-admin-after-fix:
+    name: "[jan] aws --admin AFTER fix (should be masked ***)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+      - id: jit
+        run: |
+          duploctl jit aws --admin --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" \
+            -o env -q '{ADMIN_ACCESS_KEY: AccessKeyId}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received ADMIN_ACCESS_KEY=${{ steps.jit.outputs.ADMIN_ACCESS_KEY }}"
+
+  jan-gcp-attempt:
+    name: "[jan] gcp (attempt -- may not be applicable, AWS GovCloud tenant)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+      - id: jit
+        run: |
+          duploctl jit gcp --admin --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{CLOUDSDK_AUTH_ACCESS_TOKEN: Token}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received CLOUDSDK_AUTH_ACCESS_TOKEN=${{ steps.jit.outputs.CLOUDSDK_AUTH_ACCESS_TOKEN }}"
+
+  jan-token-before-fix:
+    name: "[jan] token BEFORE fix"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+      - id: jit
+        run: |
+          duploctl jit token --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{JWT_TOKEN: token}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received JWT_TOKEN=${{ steps.jit.outputs.JWT_TOKEN }}"
+
+  jan-token-after-fix:
+    name: "[jan] token AFTER fix"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+      - id: jit
+        run: |
+          duploctl jit token --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{JWT_TOKEN: token}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received JWT_TOKEN=${{ steps.jit.outputs.JWT_TOKEN }}"
+
+  jan-k8s-before-fix:
+    name: "[jan] k8s BEFORE fix"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+      - id: jit
+        run: |
+          duploctl jit k8s --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{K8S_TOKEN: status.token}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received K8S_TOKEN=${{ steps.jit.outputs.K8S_TOKEN }}"
+
+  jan-k8s-after-fix:
+    name: "[jan] k8s AFTER fix"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+      - id: jit
+        run: |
+          duploctl jit k8s --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{K8S_TOKEN: status.token}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received K8S_TOKEN=${{ steps.jit.outputs.K8S_TOKEN }}"
+
+  jan-k8s-context-before-fix:
+    name: "[jan] k8s_context BEFORE fix (should LEAK)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+      - id: jit
+        run: |
+          duploctl jit k8s_context --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{K8S_CONTEXT_TOKEN: Token}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
+
+  jan-k8s-context-after-fix:
+    name: "[jan] k8s_context AFTER fix (STILL LEAKS -- gap)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+      - id: jit
+        run: |
+          duploctl jit k8s_context --host "${{ secrets.DUPLO_HOST_JAN }}" --token "${{ secrets.DUPLO_TOKEN_JAN }}" --tenant "${{ secrets.DUPLO_TENANT_JAN }}" \
+            -o env -q '{K8S_CONTEXT_TOKEN: Token}' >> "$GITHUB_OUTPUT"
+      - run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
