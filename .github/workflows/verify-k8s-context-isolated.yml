@@ -1,0 +1,87 @@
+name: Verify k8s_context gap (truly isolated -- no repo secrets referenced)
+
+# This workflow deliberately does NOT use secrets.* anywhere. That's the
+# whole point: GitHub Actions auto-masks a value in a run's logs once ANY
+# job in that run references it via the secrets context -- and that
+# protection is scoped to the whole run, not the individual job (we proved
+# this in duplo-qa-testing's verify-jit-mask.yml run 30245401918: reading
+# the same token from a downloaded artifact file, instead of secrets.*,
+# still came out masked, because other jobs in that same run referenced
+# secrets.DUPLO_TOKEN directly).
+#
+# Here, the token/host/tenant are workflow_dispatch inputs typed directly
+# into GitHub's "Run workflow" form at trigger time. Plain inputs are never
+# routed through the secrets store, so GitHub has no reason to mask them --
+# whatever duploctl actually prints is exactly what a real downstream
+# consumer's log would show. Both jobs run duploctl from `main` (i.e. the
+# DUPLO-42934 fix is already applied):
+#   - k8s (control): DOES call _mask_in_ci -- expected to show *** even here
+#   - k8s_context (gap under test): has NO _mask_in_ci call -- if the gap
+#     is real, this one should print the raw token in plain text
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Duplo portal host, e.g. https://oneclick.duplocloud.net"
+        required: true
+        type: string
+      tenant:
+        description: "Tenant name, e.g. maja2707"
+        required: true
+        type: string
+      token:
+        description: "Duplo token -- typed here only, never stored as a repo secret"
+        required: true
+        type: string
+
+jobs:
+  k8s-control-fixed:
+    name: "k8s (fixed, control) -- should show *** via its own masking code"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - name: Get JIT k8s exec credential
+        id: jit
+        run: |
+          duploctl jit k8s \
+            --host "${{ inputs.host }}" \
+            --token "${{ inputs.token }}" \
+            --tenant "${{ inputs.tenant }}" \
+            -o env \
+            -q '{K8S_TOKEN: status.token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_TOKEN=${{ steps.jit.outputs.K8S_TOKEN }}"
+
+  k8s-context-gap-under-test:
+    name: "k8s_context (gap under test) -- should LEAK if the gap is real"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - name: Get raw JIT k8s context
+        id: jit
+        run: |
+          duploctl jit k8s_context \
+            --host "${{ inputs.host }}" \
+            --token "${{ inputs.token }}" \
+            --tenant "${{ inputs.tenant }}" \
+            -o env \
+            -q '{K8S_CONTEXT_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
