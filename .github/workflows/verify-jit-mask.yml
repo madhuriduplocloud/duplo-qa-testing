@@ -144,9 +144,9 @@ jobs:
         id: jit
         run: |
           duploctl jit gcp \
-            --host "${{ secrets.DUPLO_HOST }}" \
-            --token "${{ secrets.DUPLO_TOKEN }}" \
-            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            --host "${{ secrets.DUPLO_HOST_GCP }}" \
+            --token "${{ secrets.DUPLO_TOKEN_GCP }}" \
+            --tenant "${{ secrets.DUPLO_TENANT_GCP }}" \
             --admin \
             -o env \
             -q '{CLOUDSDK_AUTH_ACCESS_TOKEN: Token}' \
@@ -170,9 +170,9 @@ jobs:
         id: jit
         run: |
           duploctl jit gcp \
-            --host "${{ secrets.DUPLO_HOST }}" \
-            --token "${{ secrets.DUPLO_TOKEN }}" \
-            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            --host "${{ secrets.DUPLO_HOST_GCP }}" \
+            --token "${{ secrets.DUPLO_TOKEN_GCP }}" \
+            --tenant "${{ secrets.DUPLO_TENANT_GCP }}" \
             --admin \
             -o env \
             -q '{CLOUDSDK_AUTH_ACCESS_TOKEN: Token}' \
