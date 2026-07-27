@@ -198,7 +198,7 @@ jobs:
           duploctl jit argo_wf \
             --host "${{ secrets.DUPLO_HOST }}" \
             --token "${{ secrets.DUPLO_TOKEN }}" \
-            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            --tenant "${{ secrets.DUPLO_TENANT_ARGO }}" \
             -o env \
             -q '{ARGO_TOKEN: Token}' \
             >> "$GITHUB_OUTPUT"
@@ -223,7 +223,7 @@ jobs:
           duploctl jit argo_wf \
             --host "${{ secrets.DUPLO_HOST }}" \
             --token "${{ secrets.DUPLO_TOKEN }}" \
-            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            --tenant "${{ secrets.DUPLO_TENANT_ARGO }}" \
             -o env \
             -q '{ARGO_TOKEN: Token}' \
             >> "$GITHUB_OUTPUT"
