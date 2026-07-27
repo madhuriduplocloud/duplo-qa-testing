@@ -336,3 +336,94 @@ jobs:
 
       - name: Simulate downstream consumer logging the token
         run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
+
+  # TC09 needs unambiguous proof, not "it was masked, probably because it
+  # happened to match a secret already". GitHub's automatic redaction
+  # triggers because this job's own YAML text contains `secrets.DUPLO_TOKEN`.
+  # These two jobs never write that expression at all -- stage-creds (which
+  # DOES reference the secrets, so it's masked for its own steps only)
+  # writes them to files and uploads them as a build artifact; the isolated
+  # jobs below download that artifact and read the values from disk. Since
+  # THEIR OWN YAML never evaluates secrets.*, GitHub has nothing to hide in
+  # their logs -- whatever duploctl (running main, i.e. the fix already
+  # applied) actually prints is exactly what would show up in a real
+  # consumer's log. This isolates "did the fix's masking code run" from
+  # "did GitHub's own secret-matching coincidentally help us".
+  stage-creds:
+    name: "Stage creds as an artifact (breaks GitHub's auto-redaction link)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write creds to files
+        run: |
+          mkdir -p creds
+          printf '%s' "${{ secrets.DUPLO_HOST }}" > creds/host.txt
+          printf '%s' "${{ secrets.DUPLO_TOKEN }}" > creds/token.txt
+          printf '%s' "${{ secrets.DUPLO_TENANT }}" > creds/tenant.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duplo-creds
+          path: creds/
+          retention-days: 1
+
+  isolated-k8s-fixed:
+    name: "ISOLATED k8s (fixed) -- control: should still mask via its own code"
+    needs: stage-creds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: duplo-creds
+          path: creds/
+
+      - name: Get JIT k8s exec credential (creds read from file, not secrets.*)
+        id: jit
+        run: |
+          duploctl jit k8s \
+            --host "$(cat creds/host.txt)" \
+            --token "$(cat creds/token.txt)" \
+            --tenant "$(cat creds/tenant.txt)" \
+            -o env \
+            -q '{K8S_TOKEN: status.token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_TOKEN=${{ steps.jit.outputs.K8S_TOKEN }}"
+
+  isolated-k8s-context-unfixed:
+    name: "ISOLATED k8s_context (gap) -- should LEAK, proves the gap on main"
+    needs: stage-creds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: duplo-creds
+          path: creds/
+
+      - name: Get raw JIT k8s context (creds read from file, not secrets.*)
+        id: jit
+        run: |
+          duploctl jit k8s_context \
+            --host "$(cat creds/host.txt)" \
+            --token "$(cat creds/token.txt)" \
+            --tenant "$(cat creds/tenant.txt)" \
+            -o env \
+            -q '{K8S_CONTEXT_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_CONTEXT_TOKEN=${{ steps.jit.outputs.K8S_CONTEXT_TOKEN }}"
