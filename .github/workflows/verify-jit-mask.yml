@@ -1,11 +1,20 @@
 name: Verify DUPLO-42934 jit credential masking
 
+# Each credential type gets a before-fix job (pinned to the commit right before
+# the fix, d6497fbc) and an after-fix job (main, which has the fix merged).
+# For aws, the real-world consumer (aws-actions/configure-aws-credentials) is
+# used since that's the exact scenario from the bug report. For gcp/argo_wf/
+# k8s/token there's no equivalent standard Action, so a plain `echo` step
+# stands in for "some downstream step logs this value" — GitHub's masking
+# works by matching the literal string anywhere in the log afterward, so an
+# echo is just as valid a proof as a real action's `with:` block.
+
 on:
   workflow_dispatch: {}
 
 jobs:
-  before-fix:
-    name: "BEFORE fix (should LEAK creds in logs)"
+  aws-before-fix:
+    name: "aws BEFORE fix (should LEAK creds in logs)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
@@ -37,8 +46,8 @@ jobs:
       - name: Prove creds still work
         run: aws sts get-caller-identity
 
-  after-fix:
-    name: "AFTER fix (creds should be masked ***)"
+  aws-after-fix:
+    name: "aws AFTER fix (creds should be masked ***)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
@@ -69,3 +78,205 @@ jobs:
 
       - name: Prove creds still work
         run: aws sts get-caller-identity
+
+  token-before-fix:
+    name: "token BEFORE fix (should LEAK JWT in logs)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (pre-fix commit)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+
+      - name: Get JIT token
+        id: jit
+        run: |
+          duploctl jit token \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{JWT_TOKEN: token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received JWT_TOKEN=${{ steps.jit.outputs.JWT_TOKEN }}"
+
+  token-after-fix:
+    name: "token AFTER fix (JWT should be masked ***)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - name: Get JIT token
+        id: jit
+        run: |
+          duploctl jit token \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{JWT_TOKEN: token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received JWT_TOKEN=${{ steps.jit.outputs.JWT_TOKEN }}"
+
+  gcp-before-fix:
+    name: "gcp BEFORE fix (should LEAK token in logs)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (pre-fix commit)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+
+      - name: Get JIT GCP token
+        id: jit
+        run: |
+          duploctl jit gcp \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            --admin \
+            -o env \
+            -q '{CLOUDSDK_AUTH_ACCESS_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received CLOUDSDK_AUTH_ACCESS_TOKEN=${{ steps.jit.outputs.CLOUDSDK_AUTH_ACCESS_TOKEN }}"
+
+  gcp-after-fix:
+    name: "gcp AFTER fix (token should be masked ***)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - name: Get JIT GCP token
+        id: jit
+        run: |
+          duploctl jit gcp \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            --admin \
+            -o env \
+            -q '{CLOUDSDK_AUTH_ACCESS_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received CLOUDSDK_AUTH_ACCESS_TOKEN=${{ steps.jit.outputs.CLOUDSDK_AUTH_ACCESS_TOKEN }}"
+
+  argo-before-fix:
+    name: "argo_wf BEFORE fix (should LEAK token in logs)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (pre-fix commit)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+
+      - name: Get JIT Argo Workflows token
+        id: jit
+        run: |
+          duploctl jit argo_wf \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{ARGO_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received ARGO_TOKEN=${{ steps.jit.outputs.ARGO_TOKEN }}"
+
+  argo-after-fix:
+    name: "argo_wf AFTER fix (token should be masked ***)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - name: Get JIT Argo Workflows token
+        id: jit
+        run: |
+          duploctl jit argo_wf \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{ARGO_TOKEN: Token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received ARGO_TOKEN=${{ steps.jit.outputs.ARGO_TOKEN }}"
+
+  k8s-before-fix:
+    name: "k8s BEFORE fix (should LEAK token in logs)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (pre-fix commit)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@d6497fbc21d4f17fd252d63d639ec1402d56839a"
+
+      - name: Get JIT k8s exec credential
+        id: jit
+        run: |
+          duploctl jit k8s \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{K8S_TOKEN: status.token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_TOKEN=${{ steps.jit.outputs.K8S_TOKEN }}"
+
+  k8s-after-fix:
+    name: "k8s AFTER fix (token should be masked ***)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install duploctl (main, post-fix)
+        run: pip install "git+https://github.com/duplocloud/duploctl.git@main"
+
+      - name: Get JIT k8s exec credential
+        id: jit
+        run: |
+          duploctl jit k8s \
+            --host "${{ secrets.DUPLO_HOST }}" \
+            --token "${{ secrets.DUPLO_TOKEN }}" \
+            --tenant "${{ secrets.DUPLO_TENANT }}" \
+            -o env \
+            -q '{K8S_TOKEN: status.token}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Simulate downstream consumer logging the token
+        run: echo "consumer received K8S_TOKEN=${{ steps.jit.outputs.K8S_TOKEN }}"
