@@ -250,9 +250,8 @@ jobs:
         run: echo "consumer received CLOUDSDK_AUTH_ACCESS_TOKEN=${{ steps.jit.outputs.CLOUDSDK_AUTH_ACCESS_TOKEN }}"
 
   argo-attempt:
-    name: "argo_wf (attempt -- may not be applicable on this tenant)"
+    name: "argo_wf (mj-2 tenant, has Argo Workflows configured)"
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -267,7 +266,7 @@ jobs:
           duploctl jit argo_wf \
             --host "${{ secrets.DUPLO_HOST_NOV }}" \
             --token "${{ secrets.DUPLO_TOKEN_NOV }}" \
-            --tenant "${{ secrets.DUPLO_TENANT_NOV }}" \
+            --tenant "${{ secrets.DUPLO_TENANT_ARGO_NOV }}" \
             -o env \
             -q '{ARGO_TOKEN: Token}' \
             >> "$GITHUB_OUTPUT"
